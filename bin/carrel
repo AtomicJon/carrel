@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# carrel — run an isolated, containerised Claude Code in the current project.
+#
+# carrel keeps its own config dir (CARREL_HOME, default ~/.carrel), separate from
+# your real ~/.claude. Selected config files are synced in on each launch;
+# session history and credentials stay in CARREL_HOME. The project is mounted at
+# its real host path so Claude's session IDs match a native run.
+
+set -euo pipefail
+
+CARREL_HOME="${CARREL_HOME:-$HOME/.carrel}"
+CARREL_IMAGE="${CARREL_IMAGE:-carrel}"
+
+# Config pulled from your real ~/.claude on each run. Credentials and session
+# history are deliberately excluded.
+SYNC_ITEMS=(CLAUDE.md settings.json commands agents output-styles)
+
+usage() {
+  cat <<'EOF'
+carrel — run an isolated, containerised Claude Code in the current project.
+
+Usage:
+  carrel [variant] [claude args...]   run Claude   (variant: base|rust|tauri)
+  carrel shell [variant]              open a shell instead of Claude
+  carrel sync                         sync host config into carrel's dir
+  carrel sessions [path]              print a project's session directory
+  carrel -h | --help
+
+Args after the optional variant go straight to claude, e.g.:
+  carrel --resume <id>     carrel rust -c     carrel -p "summarise this repo"
+
+Env:
+  CARREL_HOME    config dir on the host    (default: ~/.carrel)
+  CARREL_IMAGE   image name / tag prefix   (default: carrel)
+EOF
+}
+
+# One-way host -> carrel config sync. Symlinks (e.g. dotfiles) are dereferenced
+# so the container sees real files, not dangling links. Only changed files are
+# copied, and each one is printed.
+do_sync() {
+  mkdir -p "$CARREL_HOME/claude"
+  # Guard against a stray directory at this path (Docker creates one if the file
+  # is bind-mounted before it exists), then seed an empty config if missing.
+  if [ -e "$CARREL_HOME/claude.json" ] && [ ! -f "$CARREL_HOME/claude.json" ]; then
+    rm -rf "$CARREL_HOME/claude.json"
+  fi
+  [ -f "$CARREL_HOME/claude.json" ] || echo '{}' >"$CARREL_HOME/claude.json"
+
+  local dst="$CARREL_HOME/claude" i src
+  for i in "${SYNC_ITEMS[@]}"; do
+    src="$HOME/.claude/$i"
+    [ -e "$src" ] || continue
+    if command -v rsync >/dev/null 2>&1; then
+      # -aL: archive + dereference symlinks. --delete (scoped to this item's own
+      # directory, never the whole config dir) mirrors host-side removals.
+      # --out-format prints only what changed.
+      if [ -d "$src" ]; then
+        rsync -aL --delete --out-format="  synced $i/%n" "$src/" "$dst/$i/"
+      else
+        rsync -aL --out-format='  synced %n' "$src" "$dst/"
+      fi
+    else
+      # Fallback when rsync isn't installed: full replace, no change detection.
+      rm -rf "$dst/$i"
+      cp -RL "$src" "$dst/$i" && echo "  synced $i"
+    fi
+  done
+}
+
+# Claude keys session history by the project path, with slashes turned to dashes.
+session_dir() {
+  local p="${1:-$PWD}"
+  printf '%s/claude/projects/%s\n' "$CARREL_HOME" "${p//\//-}"
+}
+
+launch=claude
+case "${1:-}" in
+  -h | --help) usage; exit 0 ;;
+  sync)        do_sync; exit 0 ;;
+  sessions)    shift; session_dir "${1:-$PWD}"; exit 0 ;;
+  shell)       launch=shell; shift ;;
+esac
+
+tag=base
+case "${1:-}" in base | rust | tauri) tag="$1"; shift ;; esac
+
+do_sync
+
+run=(
+  docker run --rm -it -w "$PWD"
+  -v "$CARREL_HOME/claude":/home/claude/.claude
+  -v "$CARREL_HOME/claude.json":/home/claude/.claude.json
+  -v "${CARREL_IMAGE}-claude":/home/claude/.local/share/claude
+  -v "${CARREL_IMAGE}-node":/home/claude/.nvm/versions/node
+  -v "$PWD":"$PWD"
+  "${CARREL_IMAGE}:${tag}"
+)
+
+if [ "$launch" = shell ]; then
+  exec "${run[@]}" bash
+else
+  exec "${run[@]}" claude "$@"
+fi
