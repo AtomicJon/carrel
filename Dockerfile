@@ -57,11 +57,14 @@ RUN chmod +x /usr/local/bin/carrel-entrypoint
 
 # Non-root user. uid 1000 matches the typical host user so bind-mounted files
 # keep sane ownership. safe.directory '*' stops Git complaining about repos
-# owned by a different uid.
+# owned by a different uid. The pnpm/yarn cache dirs are pre-created (owned by
+# claude) so a named volume mounted there — the recommended way to persist a
+# package-manager cache — inherits claude ownership instead of root's.
 RUN useradd --create-home --shell /bin/bash --uid 1000 claude \
     && git config --system --add safe.directory '*' \
     && mkdir -p /workspace /home/claude/.claude \
         /home/claude/.local/bin /home/claude/.local/share/claude \
+        /home/claude/.local/share/pnpm /home/claude/.cache/yarn \
     && chown -R claude:claude /workspace /home/claude
 
 USER claude

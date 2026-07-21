@@ -74,6 +74,7 @@ and modify a project without touching your host environment. Each run is
 - the project directory → mounted at its real host path
 - a named `carrel-claude` volume → the Claude binary (`~/.local/share/claude`)
 - a named `carrel-node` volume → cached Node versions
+- anything you opt into via [extra mounts](#extra-mounts) (ssh key, caches, …)
 
 Goals:
 
@@ -151,6 +152,45 @@ rather reuse your host login (note: the container can then use that token).
 > Because the whitelist is overwritten each run, host is the source of truth for
 > those files — if the container edits its `settings.json`, the change lives only
 > in `~/.carrel` and is replaced on the next sync.
+
+### Extra mounts
+
+By default only the project directory crosses into the container. Some work
+needs a few host-side items from *outside* the project — an SSH key to
+`git push`, your `~/.gitconfig`, or a warm package-manager cache. Pass those in
+without editing the launcher:
+
+- **Standing set** — list them in `~/.carrel/mounts` (`$CARREL_HOME/mounts`), one
+  per line; blank lines and `#` comments are ignored.
+- **One-off** — repeat `-m` / `--mount SPEC` on the command line, e.g.
+  `carrel --mount ~/.aws:/home/claude/.aws rust`.
+
+Each spec is `HOST[:CONTAINER][:ro|:rw]`:
+
+- `HOST` — a host path (leading `~` and `$VARs` are expanded) **or** a Docker
+  named volume (no leading `/`, e.g. `carrel-pnpm`).
+- `CONTAINER` — where it lands inside the container. Optional for host paths
+  (defaults to the same absolute path, like the project mount); **required** for
+  named volumes. Home-relative items must set this: the container runs as
+  `claude`, so `~` there is `/home/claude`, not your host home.
+- `:ro` / `:rw` — access mode, **read-only by default**. An autonomous agent runs
+  in the container, so writes are opt-in per mount.
+
+```
+# ~/.carrel/mounts
+~/.ssh:/home/claude/.ssh                       # git over SSH (read-only)
+~/.gitconfig:/home/claude/.gitconfig           # name / email / aliases
+carrel-pnpm:/home/claude/.local/share/pnpm:rw  # persistent pnpm store
+carrel-yarn:/home/claude/.cache/yarn:rw        # persistent yarn cache
+```
+
+A volume spec with no container path, or a host path that doesn't exist, is
+skipped with a warning rather than launching a broken container.
+
+> **Keep it tight.** Every extra mount widens what the container — and the agent
+> inside it — can touch. Mount secrets read-only, mount the narrowest path that
+> works, and prefer isolated named volumes (`carrel-pnpm`, seeded empty and
+> persisted across runs) over bind-mounting your real host cache dir.
 
 ### Analyzing sessions
 

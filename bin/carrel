@@ -16,6 +16,11 @@ CARREL_IMAGE="${CARREL_IMAGE:-carrel}"
 # history are deliberately excluded.
 SYNC_ITEMS=(CLAUDE.md settings.json commands agents output-styles)
 
+# Extra host items to pass into the container, on top of the project itself.
+# Populated from $CARREL_HOME/mounts and any -m/--mount flags. Each entry is a
+# spec: HOST[:CONTAINER][:ro|:rw] — see resolve_mount below.
+EXTRA_MOUNTS=()
+
 usage() {
   cat <<'EOF'
 carrel — run an isolated, containerised Claude Code in the current project.
@@ -29,6 +34,12 @@ Usage:
 
 Args after the optional variant go straight to claude, e.g.:
   carrel --resume <id>     carrel rust -c     carrel -p "summarise this repo"
+
+Extra mounts:
+  -m, --mount SPEC   pass an extra host item into the container (repeatable).
+                     SPEC is HOST[:CONTAINER][:ro|:rw]; read-only by default.
+                     Standing mounts live in $CARREL_HOME/mounts (one per line).
+  e.g. carrel -m ~/.ssh:/home/claude/.ssh -m ~/.gitconfig:/home/claude/.gitconfig
 
 Env:
   CARREL_HOME    config dir on the host    (default: ~/.carrel)
@@ -69,6 +80,72 @@ do_sync() {
   done
 }
 
+# Parse one mount spec (HOST[:CONTAINER][:ro|:rw]) into a normalised
+# host:container:mode string for `docker -v`, printed on stdout. Returns non-zero
+# (and prints nothing) when the spec should be skipped; diagnostics go to stderr.
+#
+# HOST is a host path (leading ~ and $VARs expanded) or a Docker named volume
+# (no leading /). CONTAINER defaults to HOST's path when omitted, but is required
+# for named volumes. Mode defaults to ro — an autonomous agent runs in here, so
+# writes are opt-in per mount. Specs are never eval'd, so a config line can't
+# inject shell.
+resolve_mount() {
+  local spec="$1" mode host container
+
+  case "$spec" in
+    *:ro) mode=ro; spec="${spec%:ro}" ;;
+    *:rw) mode=rw; spec="${spec%:rw}" ;;
+    *)    mode=ro ;;
+  esac
+
+  if [[ "$spec" == *:* ]]; then
+    host="${spec%%:*}"
+    container="${spec#*:}"
+  else
+    host="$spec"
+    container=""
+  fi
+
+  # Expand a leading ~ and any $VARs in the host part (bind mounts only).
+  host="${host/#\~/$HOME}"
+  while [[ "$host" == *'$'* ]]; do
+    local name rest="${host#*\$}"
+    name="${rest%%[^A-Za-z0-9_]*}"
+    [ -n "$name" ] || break
+    host="${host//\$$name/${!name-}}"
+  done
+
+  if [[ "$host" == /* ]]; then
+    # Bind mount. Default the container path to the host path (the $PWD pattern).
+    [ -n "$container" ] || container="$host"
+    if [ ! -e "$host" ]; then
+      echo "carrel: skipping mount, host path not found: $host" >&2
+      return 1
+    fi
+  else
+    # Named volume — needs an explicit absolute container target.
+    if [ -z "$container" ]; then
+      echo "carrel: skipping mount, volume '$host' needs a container path (VOLUME:/path)" >&2
+      return 1
+    fi
+  fi
+
+  printf '%s:%s:%s' "$host" "$container" "$mode"
+}
+
+# Load standing mount specs from $CARREL_HOME/mounts into EXTRA_MOUNTS. Blank
+# lines and #-comment lines are ignored.
+load_mount_file() {
+  local file="$CARREL_HOME/mounts" line
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "${line#"${line%%[![:space:]]*}"}" in
+      '' | '#'*) continue ;;
+    esac
+    EXTRA_MOUNTS+=("$line")
+  done <"$file"
+}
+
 # Claude keys session history by the project path, with slashes turned to dashes.
 session_dir() {
   local p="${1:-$PWD}"
@@ -83,10 +160,32 @@ case "${1:-}" in
   shell)       launch=shell; shift ;;
 esac
 
+# Standing mounts from the config file load first, then any -m/--mount flags
+# append — so a flag adds to (rather than replaces) the standing set.
+load_mount_file
+
+# Pull -m/--mount flags out of the remaining args (they can sit anywhere among
+# the claude args); everything else passes through to claude untouched.
+remaining=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m | --mount) EXTRA_MOUNTS+=("${2:?carrel: --mount needs a spec}"); shift 2 ;;
+    --mount=*)    EXTRA_MOUNTS+=("${1#--mount=}"); shift ;;
+    *)            remaining+=("$1"); shift ;;
+  esac
+done
+set -- ${remaining[@]+"${remaining[@]}"}
+
 tag=base
 case "${1:-}" in base | rust | tauri) tag="$1"; shift ;; esac
 
 do_sync
+
+mount_args=()
+for spec in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
+  resolved="$(resolve_mount "$spec")" || continue
+  mount_args+=(-v "$resolved")
+done
 
 run=(
   docker run --rm -it -w "$PWD"
@@ -95,6 +194,7 @@ run=(
   -v "${CARREL_IMAGE}-claude":/home/claude/.local/share/claude
   -v "${CARREL_IMAGE}-node":/home/claude/.nvm/versions/node
   -v "$PWD":"$PWD"
+  ${mount_args[@]+"${mount_args[@]}"}
   "${CARREL_IMAGE}:${tag}"
 )
 
