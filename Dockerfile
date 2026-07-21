@@ -2,7 +2,7 @@
 #
 # Multi-target image for running Claude Code in a sandboxed dev container.
 #
-#   base   debian-slim + code search/nav tools + nvm.
+#   base   debian-slim + code search/nav tools + gh/glab CLIs + nvm.
 #          Neither Claude nor Node is baked in; the entrypoint installs Claude
 #          on first launch and provisions the project's Node version on demand,
 #          both cached in volumes, so the image stays small and Claude
@@ -20,6 +20,7 @@
 FROM debian:stable-20260610-slim AS base
 
 ARG NVM_VERSION=v0.40.1
+ARG GLAB_VERSION=1.108.0
 
 # UTF-8 locale; quieter npm. Claude lives in a persistent volume (see the
 # entrypoint), so its background auto-updater is left enabled — updates stick.
@@ -50,6 +51,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     # Debian ships fd as `fdfind`; expose the familiar `fd` name too.
     && ln -s "$(command -v fdfind)" /usr/local/bin/fd
+
+# GitHub + GitLab CLIs so the agent can view and open PRs/MRs. gh comes from
+# GitHub's official apt repo (keyring pinned); glab has no first-party apt repo,
+# so its release .deb is installed directly, version-pinned like the other
+# toolchains. `apt-get install ./file.deb` pulls in the .deb's own deps.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_$(dpkg --print-architecture).deb" \
+        -o /tmp/glab.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh /tmp/glab.deb \
+    && rm -f /tmp/glab.deb \
+    && rm -rf /var/lib/apt/lists/*
 
 # Provisions Node lazily at container start (see the script for details).
 COPY entrypoint.sh /usr/local/bin/carrel-entrypoint

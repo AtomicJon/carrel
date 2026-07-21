@@ -48,11 +48,11 @@ model.
 
 Pick the variant that matches the project:
 
-| Run            | For                        | Includes                                          | Size   |
-| -------------- | -------------------------- | ------------------------------------------------- | ------ |
-| `carrel`       | General use + JS/TS        | ripgrep, fd, fzf, jq, tree, git, nvm (+ corepack) | ~210MB |
-| `carrel rust`  | Rust                       | base + rustup, clippy, rustfmt                    | ~1.0GB |
-| `carrel tauri` | Tauri desktop apps         | rust + web build deps (webkit, gtk) + tauri-cli   | ~2.1GB |
+| Run            | For                        | Includes                                                    | Size   |
+| -------------- | -------------------------- | ----------------------------------------------------------- | ------ |
+| `carrel`       | General use + JS/TS        | ripgrep, fd, fzf, jq, tree, git, gh, glab, nvm (+ corepack) | ~260MB |
+| `carrel rust`  | Rust                       | base + rustup, clippy, rustfmt                              | ~1.1GB |
+| `carrel tauri` | Tauri desktop apps         | rust + web build deps (webkit, gtk) + tauri-cli             | ~2.1GB |
 
 > Sizes are the images. Claude itself (~250MB) and Node live in shared volumes,
 > not the images.
@@ -81,9 +81,10 @@ Goals:
 - **Isolation by default.** Claude and every language toolchain live in the
   container, not on your machine. Delete the image and it's gone.
 - **Minimal footprint, maximum reach.** A small Debian-slim base carries only
-  the tools Claude needs to navigate code. Neither Claude nor Node is baked in —
-  both are installed on first launch into volumes (see below). Heavier
-  toolchains are opt-in variants layered on top.
+  the tools Claude needs to navigate code, plus the `gh`/`glab` CLIs so it can
+  view and open PRs/MRs. Neither Claude nor Node is baked in — both are
+  installed on first launch into volumes (see below). Heavier toolchains are
+  opt-in variants layered on top.
 - **Always-current Claude.** Claude is installed via its native standalone
   binary (no Node dependency, ripgrep bundled) into a persistent volume shared
   by every variant, so its background auto-updater keeps it fresh between runs —
@@ -180,9 +181,16 @@ Each spec is `HOST[:CONTAINER][:ro|:rw]`:
 # ~/.carrel/mounts
 ~/.ssh:/home/claude/.ssh                       # git over SSH (read-only)
 ~/.gitconfig:/home/claude/.gitconfig           # name / email / aliases
+~/.config/gh:/home/claude/.config/gh           # gh login (view/open PRs)
+~/.config/glab-cli:/home/claude/.config/glab-cli  # glab login (view/open MRs)
 carrel-pnpm:/home/claude/.local/share/pnpm:rw  # persistent pnpm store
 carrel-yarn:/home/claude/.cache/yarn:rw        # persistent yarn cache
 ```
+
+> The `gh`/`glab` CLIs are in the image, but the container has its own isolated
+> home, so it won't pick up your host login. Mount the config dirs above (or set
+> a token another way) to let the agent act on your PRs/MRs. Read-only is enough
+> for token auth; grant `:rw` only if you want the container to refresh it.
 
 A volume spec with no container path, or a host path that doesn't exist, is
 skipped with a warning rather than launching a broken container.
@@ -252,12 +260,17 @@ at build time:
 ```bash
 docker build --target base \
   --build-arg NVM_VERSION=v0.40.1 \
+  --build-arg GLAB_VERSION=1.108.0 \
   -t carrel:base .
 
 docker build --target rust \
   --build-arg RUST_TOOLCHAIN=1.84.0 \
   -t carrel:rust .
 ```
+
+> `gh` self-updates via apt and needs no pin; `glab` has no first-party apt
+> repo, so its release `.deb` is version-pinned by `GLAB_VERSION`. Bump it to
+> upgrade glab.
 
 ## Make targets
 
