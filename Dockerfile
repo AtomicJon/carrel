@@ -52,6 +52,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Debian ships fd as `fdfind`; expose the familiar `fd` name too.
     && ln -s "$(command -v fdfind)" /usr/local/bin/fd
 
+# Trust Let's Encrypt's new ISRG root (root-yr-by-x1). Debian stable's
+# ca-certificates predates it, so TLS to sites already serving that chain fails
+# until the root is added to the trust store. Runs before the CLI installs below
+# so their downloads benefit too.
+RUN curl -fsSL -o /usr/local/share/ca-certificates/isrg-root-yr-by-x1.crt \
+        https://letsencrypt.org/certs/gen-y/root-yr-by-x1.pem \
+    && update-ca-certificates
+
 # GitHub + GitLab CLIs so the agent can view and open PRs/MRs. gh comes from
 # GitHub's official apt repo (keyring pinned); glab has no first-party apt repo,
 # so its release .deb is installed directly, version-pinned like the other
