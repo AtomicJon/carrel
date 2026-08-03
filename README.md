@@ -126,6 +126,7 @@ uses.
 ├── claude/                 →  ~/.claude in the container
 │   ├── CLAUDE.md           synced from your real ~/.claude (overwritten each run)
 │   ├── settings.json       synced from your real ~/.claude (overwritten each run)
+│   ├── statusline-command.sh   ditto — the status line script settings.json runs
 │   ├── .credentials.json   carrel's own login (created on first auth, persists)
 │   └── projects/           session history, per project ← analyze these
 └── claude.json             →  ~/.claude.json in the container
@@ -137,8 +138,16 @@ with `rsync -aL` — symlinks (e.g. dotfiles) are dereferenced, only changed fil
 are copied, and each change is printed. The whitelist is:
 
 ```
-CLAUDE.md  settings.json  commands  agents  output-styles
+CLAUDE.md  settings.json  statusline-command.sh  commands  agents  output-styles
 ```
+
+`settings.json` is the one file that isn't copied verbatim. Commands it runs —
+`statusLine`, hooks — refer to scripts by their **host** path under `~/.claude`,
+which is mounted at `/home/claude/.claude` in the container, so those paths are
+rewritten on the way in. (`~` and `$HOME` need no rewriting; they already point
+at the right place inside.) Anything else in the file is passed through
+untouched, including hooks that shell out to host-only tools — a
+`notify-send`/`paplay` hook, say, simply fails inside the container.
 
 `--delete` is applied **per whitelisted directory**, so removing a file from
 `~/.claude/commands/` removes it from carrel too — but it never touches anything

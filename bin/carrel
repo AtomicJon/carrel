@@ -13,8 +13,9 @@ CARREL_HOME="${CARREL_HOME:-$HOME/.carrel}"
 CARREL_IMAGE="${CARREL_IMAGE:-carrel}"
 
 # Config pulled from your real ~/.claude on each run. Credentials and session
-# history are deliberately excluded.
-SYNC_ITEMS=(CLAUDE.md settings.json commands agents output-styles)
+# history are deliberately excluded. settings.json is handled separately (see
+# sync_settings) because it needs a path fixup.
+SYNC_ITEMS=(CLAUDE.md commands agents output-styles statusline-command.sh)
 
 # Extra host items to pass into the container, on top of the project itself.
 # Populated from $CARREL_HOME/mounts and any -m/--mount flags. Each entry is a
@@ -45,6 +46,28 @@ Env:
   CARREL_HOME    config dir on the host    (default: ~/.carrel)
   CARREL_IMAGE   image name / tag prefix   (default: carrel)
 EOF
+}
+
+# settings.json, with a path fixup. Commands it runs (statusLine, hooks) point at
+# scripts by their host path under ~/.claude, which is mounted at
+# /home/claude/.claude in the container — rewrite those so they resolve there.
+# ~ and $HOME references need no fixup: they already expand correctly in the
+# container. The rewritten file is compared before replacing, so an unchanged
+# config stays quiet instead of reporting a sync every run.
+sync_settings() {
+  local src="$HOME/.claude/settings.json" dst="$CARREL_HOME/claude/settings.json"
+  [ -f "$src" ] || return 0
+
+  local tmp
+  tmp="$(mktemp "$dst.XXXXXX")"
+  sed "s|$HOME/.claude|/home/claude/.claude|g" "$src" >"$tmp"
+  if cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp"
+  else
+    chmod 644 "$tmp"
+    mv "$tmp" "$dst"
+    echo "  synced settings.json"
+  fi
 }
 
 # One-way host -> carrel config sync. Symlinks (e.g. dotfiles) are dereferenced
@@ -78,6 +101,8 @@ do_sync() {
       cp -RL "$src" "$dst/$i" && echo "  synced $i"
     fi
   done
+
+  sync_settings
 }
 
 # Parse one mount spec (HOST[:CONTAINER][:ro|:rw]) into a normalised
