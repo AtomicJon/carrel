@@ -15,7 +15,7 @@ CARREL_IMAGE="${CARREL_IMAGE:-carrel}"
 # Config pulled from your real ~/.claude on each run. Credentials and session
 # history are deliberately excluded. settings.json is handled separately (see
 # sync_settings) because it needs a path fixup.
-SYNC_ITEMS=(CLAUDE.md commands agents output-styles statusline-command.sh)
+SYNC_ITEMS=(CLAUDE.md skills agents output-styles statusline-command.sh notify.sh)
 
 # Extra host items to pass into the container, on top of the project itself.
 # Populated from $CARREL_HOME/mounts and any -m/--mount flags. Each entry is a
@@ -118,9 +118,15 @@ resolve_mount() {
   local spec="$1" mode host container
 
   case "$spec" in
-    *:ro) mode=ro; spec="${spec%:ro}" ;;
-    *:rw) mode=rw; spec="${spec%:rw}" ;;
-    *)    mode=ro ;;
+    *:ro)
+      mode=ro
+      spec="${spec%:ro}"
+      ;;
+    *:rw)
+      mode=rw
+      spec="${spec%:rw}"
+      ;;
+    *) mode=ro ;;
   esac
 
   if [[ "$spec" == *:* ]]; then
@@ -179,10 +185,23 @@ session_dir() {
 
 launch=claude
 case "${1:-}" in
-  -h | --help) usage; exit 0 ;;
-  sync)        do_sync; exit 0 ;;
-  sessions)    shift; session_dir "${1:-$PWD}"; exit 0 ;;
-  shell)       launch=shell; shift ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  sync)
+    do_sync
+    exit 0
+    ;;
+  sessions)
+    shift
+    session_dir "${1:-$PWD}"
+    exit 0
+    ;;
+  shell)
+    launch=shell
+    shift
+    ;;
 esac
 
 # Standing mounts from the config file load first, then any -m/--mount flags
@@ -194,15 +213,28 @@ load_mount_file
 remaining=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -m | --mount) EXTRA_MOUNTS+=("${2:?carrel: --mount needs a spec}"); shift 2 ;;
-    --mount=*)    EXTRA_MOUNTS+=("${1#--mount=}"); shift ;;
-    *)            remaining+=("$1"); shift ;;
+    -m | --mount)
+      EXTRA_MOUNTS+=("${2:?carrel: --mount needs a spec}")
+      shift 2
+      ;;
+    --mount=*)
+      EXTRA_MOUNTS+=("${1#--mount=}")
+      shift
+      ;;
+    *)
+      remaining+=("$1")
+      shift
+      ;;
   esac
 done
 set -- ${remaining[@]+"${remaining[@]}"}
 
 tag=base
-case "${1:-}" in base | rust | tauri) tag="$1"; shift ;; esac
+case "${1:-}" in base | rust | tauri)
+  tag="$1"
+  shift
+  ;;
+esac
 
 do_sync
 
