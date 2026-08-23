@@ -209,6 +209,25 @@ skipped with a warning rather than launching a broken container.
 > works, and prefer isolated named volumes (`carrel-pnpm`, seeded empty and
 > persisted across runs) over bind-mounting your real host cache dir.
 
+### Timezone
+
+The Debian base image runs on UTC. Left alone, every timestamp inside the
+container is offset from the clock you're reading: git commit dates, file
+mtimes, and the status line's usage-reset time all disagree with the host.
+
+So `carrel` passes the host's timezone in as `TZ` on each launch, reading (in
+order) `$CARREL_TZ`, `$TZ`, `/etc/timezone`, then the `/etc/localtime` symlink.
+That covers Debian-style, systemd, and macOS hosts. Set `CARREL_TZ` to pin a
+different zone:
+
+```bash
+CARREL_TZ=UTC carrel            # keep the container on UTC
+CARREL_TZ=Europe/Berlin carrel  # or anywhere else
+```
+
+If none of the sources resolve, no `TZ` is set and the container stays on UTC as
+before.
+
 ### Analyzing sessions
 
 Because each project mounts at its **real host path**, Claude stores session
@@ -295,7 +314,8 @@ docker build --target rust \
 Useful overrides: `IMAGE` (image name, default `carrel`), `TAG` (variant,
 default `base`), `ARGS` (extra args for `claude`, e.g. `--resume <id>`),
 `WORKDIR` (project dir, default the current directory), `CARREL_HOME` (carrel's
-config dir, default `~/.carrel`).
+config dir, default `~/.carrel`), `CARREL_TZ` (container timezone, default the
+host's).
 
 ## Contributing
 

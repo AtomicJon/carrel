@@ -45,6 +45,7 @@ Extra mounts:
 Env:
   CARREL_HOME    config dir on the host    (default: ~/.carrel)
   CARREL_IMAGE   image name / tag prefix   (default: carrel)
+  CARREL_TZ      container timezone        (default: the host's)
 EOF
 }
 
@@ -177,6 +178,32 @@ load_mount_file() {
   done <"$file"
 }
 
+# The host's IANA timezone name, printed on stdout (empty if it can't be
+# determined). Debian's clock is UTC, so without this every timestamp the agent
+# sees (file mtimes, git dates, the status line's usage-reset time) is offset
+# from the wall clock. CARREL_TZ overrides; /etc/timezone is Debian-style, the
+# /etc/localtime symlink covers the rest (systemd distros, macOS).
+host_timezone() {
+  if [ -n "${CARREL_TZ:-}" ]; then
+    printf '%s' "$CARREL_TZ"
+    return 0
+  fi
+  if [ -n "${TZ:-}" ]; then
+    printf '%s' "$TZ"
+    return 0
+  fi
+  if [ -s /etc/timezone ]; then
+    tr -d '[:space:]' </etc/timezone
+    return 0
+  fi
+
+  local target
+  target="$(readlink -f /etc/localtime 2>/dev/null || true)"
+  case "$target" in
+    */zoneinfo/*) printf '%s' "${target#*/zoneinfo/}" ;;
+  esac
+}
+
 # Claude keys session history by the project path, with slashes turned to dashes.
 session_dir() {
   local p="${1:-$PWD}"
@@ -244,8 +271,13 @@ for spec in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
   mount_args+=(-v "$resolved")
 done
 
+tz_args=()
+tz="$(host_timezone)"
+[ -n "$tz" ] && tz_args=(-e "TZ=$tz")
+
 run=(
   docker run --rm -it -w "$PWD"
+  ${tz_args[@]+"${tz_args[@]}"}
   -v "$CARREL_HOME/claude":/home/claude/.claude
   -v "$CARREL_HOME/claude.json":/home/claude/.claude.json
   -v "${CARREL_IMAGE}-claude":/home/claude/.local/share/claude

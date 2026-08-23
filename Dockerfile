@@ -35,7 +35,12 @@ ENV LANG=C.UTF-8 \
 # tree, less   : navigation + paging (git needs a pager)
 # git          : latest available in Debian stable (security-patched via apt)
 # libstdc++6   : runtime for the prebuilt Claude binary (installed at runtime)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# tzdata       : zone database, so the TZ the launcher passes in resolves
+#
+# noninteractive keeps tzdata from stopping the build on its region prompt if it
+# ever needs a real install (the base image currently ships it).
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
@@ -48,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         openssh-client \
         libstdc++6 \
+        tzdata \
     && rm -rf /var/lib/apt/lists/* \
     # Debian ships fd as `fdfind`; expose the familiar `fd` name too.
     && ln -s "$(command -v fdfind)" /usr/local/bin/fd
