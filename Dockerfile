@@ -36,6 +36,9 @@ ENV LANG=C.UTF-8 \
 # git          : latest available in Debian stable (security-patched via apt)
 # libstdc++6   : runtime for the prebuilt Claude binary (installed at runtime)
 # tzdata       : zone database, so the TZ the launcher passes in resolves
+# wl-clipboard : wl-paste, which Claude shells out to for image paste. Inert
+#                unless the launcher forwards a Wayland socket (carrel
+#                --clipboard); see the clipboard section of bin/carrel.
 #
 # noninteractive keeps tzdata from stopping the build on its region prompt if it
 # ever needs a real install (the base image currently ships it).
@@ -54,6 +57,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
         openssh-client \
         libstdc++6 \
         tzdata \
+        wl-clipboard \
     && rm -rf /var/lib/apt/lists/* \
     # Debian ships fd as `fdfind`; expose the familiar `fd` name too.
     && ln -s "$(command -v fdfind)" /usr/local/bin/fd

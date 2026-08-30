@@ -75,6 +75,7 @@ and modify a project without touching your host environment. Each run is
 - a named `carrel-claude` volume → the Claude binary (`~/.local/share/claude`)
 - a named `carrel-node` volume → cached Node versions
 - anything you opt into via [extra mounts](#extra-mounts) (ssh key, caches, …)
+  or the [clipboard](#clipboard--image-paste) flag
 
 Goals:
 
@@ -208,6 +209,52 @@ skipped with a warning rather than launching a broken container.
 > inside it — can touch. Mount secrets read-only, mount the narrowest path that
 > works, and prefer isolated named volumes (`carrel-pnpm`, seeded empty and
 > persisted across runs) over bind-mounting your real host cache dir.
+
+### Clipboard & image paste
+
+Text pastes into a containerised Claude just fine — that's the terminal handing
+over characters. Images don't, because a terminal only ever sends text. When you
+press <kbd>Ctrl</kbd>+<kbd>V</kbd>, Claude reads the clipboard *itself*, shelling
+out to `wl-paste`/`xclip`. Inside a container there's no display server to ask,
+so nothing arrives.
+
+`--clipboard` fixes that by binding the host's Wayland socket into the
+container:
+
+```bash
+carrel --clipboard              # this run only
+carrel --clipboard rust -c      # works alongside a variant and claude args
+CARREL_CLIPBOARD=1 carrel       # standing (export it from your shell rc)
+carrel --no-clipboard           # opt back out for one run
+```
+
+It's **off by default on purpose.** The socket is a live line to your session
+for as long as the container runs: the agent can read anything you copy —
+passwords, tokens, whatever was in the buffer — and overwrite it. That's a real
+widening of the boundary, so it's a per-run decision rather than a default.
+
+Requirements:
+
+- **A Wayland session.** Without `WAYLAND_DISPLAY`, carrel warns and launches
+  normally. X11 sessions aren't supported: forwarding an X socket would let the
+  container read every keystroke and window in your session, not just the
+  clipboard.
+- **A compositor with a clipboard-manager protocol** (`wlr-data-control` or
+  `ext-data-control`). wlroots (Hyprland, sway), KWin, and Mutter 48+ have one.
+  Older GNOME — including **Ubuntu 24.04 LTS** — doesn't hand the clipboard to
+  Wayland clients at all, so there's nothing to forward.
+
+Quick check: if `wl-paste -l` lists an `image/png` line on the host after you
+copy an image, it'll work in the container too.
+
+> **macOS isn't supported.** Docker runs inside a Linux VM there, and macOS
+> keeps its clipboard behind `pbpaste`/`osascript` on the host side of that
+> boundary — there's no socket to forward. Save the image to a file under the
+> project instead and hand Claude the path; it reads image files directly.
+
+`wl-clipboard` ships in the base image, so `--clipboard` needs no rebuild beyond
+picking up a current image. The socket is the *only* thing forwarded — no
+`XDG_RUNTIME_DIR`, no other host runtime state.
 
 ### Timezone
 

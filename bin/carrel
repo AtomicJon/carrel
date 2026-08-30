@@ -22,6 +22,13 @@ SYNC_ITEMS=(CLAUDE.md skills agents output-styles statusline-command.sh notify.s
 # spec: HOST[:CONTAINER][:ro|:rw] — see resolve_mount below.
 EXTRA_MOUNTS=()
 
+# Whether to give the container a line to the host clipboard. Off unless asked
+# for, via --clipboard or CARREL_CLIPBOARD=1 — see clipboard_args.
+CLIPBOARD="${CARREL_CLIPBOARD:-0}"
+
+# Where the host's Wayland socket lands inside the container.
+CLIPBOARD_SOCKET=/run/carrel/wayland.sock
+
 usage() {
   cat <<'EOF'
 carrel — run an isolated, containerised Claude Code in the current project.
@@ -42,10 +49,18 @@ Extra mounts:
                      Standing mounts live in $CARREL_HOME/mounts (one per line).
   e.g. carrel -m ~/.ssh:/home/claude/.ssh -m ~/.gitconfig:/home/claude/.gitconfig
 
+Clipboard:
+  --clipboard        forward the host's Wayland clipboard, so Ctrl-V can paste
+                     images into Claude. Off by default (it hands the agent your
+                     clipboard). Wayland only. CARREL_CLIPBOARD=1 makes it
+                     standing.
+  --no-clipboard     override a standing CARREL_CLIPBOARD=1 for one run.
+
 Env:
-  CARREL_HOME    config dir on the host    (default: ~/.carrel)
-  CARREL_IMAGE   image name / tag prefix   (default: carrel)
-  CARREL_TZ      container timezone        (default: the host's)
+  CARREL_HOME       config dir on the host    (default: ~/.carrel)
+  CARREL_IMAGE      image name / tag prefix   (default: carrel)
+  CARREL_TZ         container timezone        (default: the host's)
+  CARREL_CLIPBOARD  1 to forward the clipboard by default
 EOF
 }
 
@@ -204,6 +219,44 @@ host_timezone() {
   esac
 }
 
+# Docker args giving the container access to the host clipboard, printed one per
+# line (empty when off or unavailable).
+#
+# Pasting an image into Claude isn't a terminal paste — the terminal only ever
+# sends text. Claude shells out to wl-paste/xclip and reads the clipboard
+# itself, so the container needs its own connection to the display server.
+#
+# Wayland only, and deliberately opt-in: the socket lets the agent read whatever
+# you copy, and write to it, for the life of the session. libwayland treats a
+# WAYLAND_DISPLAY containing a slash as a literal socket path, so binding the
+# socket to a fixed path avoids having to fake XDG_RUNTIME_DIR (which other
+# tools in the container would then trip over). The mount is read-write because
+# talking to a socket is a write.
+#
+# Reading the clipboard needs a compositor that implements wlr-data-control or
+# ext-data-control: wlroots (Hyprland, sway), KWin, and Mutter 48+ do. Older
+# GNOME doesn't expose the clipboard to Wayland clients at all, so nothing to
+# forward there.
+clipboard_args() {
+  [ "$CLIPBOARD" = 1 ] || return 0
+
+  if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "carrel: --clipboard needs a Wayland session (WAYLAND_DISPLAY is unset); continuing without it" >&2
+    return 0
+  fi
+
+  # WAYLAND_DISPLAY is a socket name inside XDG_RUNTIME_DIR, or a path already.
+  local sock="$WAYLAND_DISPLAY"
+  [[ "$sock" == /* ]] || sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock"
+
+  if [ ! -S "$sock" ]; then
+    echo "carrel: --clipboard found no Wayland socket at $sock; continuing without it" >&2
+    return 0
+  fi
+
+  printf '%s\n' -v "$sock:$CLIPBOARD_SOCKET:rw" -e "WAYLAND_DISPLAY=$CLIPBOARD_SOCKET"
+}
+
 # Claude keys session history by the project path, with slashes turned to dashes.
 session_dir() {
   local p="${1:-$PWD}"
@@ -248,6 +301,14 @@ while [ "$#" -gt 0 ]; do
       EXTRA_MOUNTS+=("${1#--mount=}")
       shift
       ;;
+    --clipboard)
+      CLIPBOARD=1
+      shift
+      ;;
+    --no-clipboard)
+      CLIPBOARD=0
+      shift
+      ;;
     *)
       remaining+=("$1")
       shift
@@ -275,9 +336,13 @@ tz_args=()
 tz="$(host_timezone)"
 [ -n "$tz" ] && tz_args=(-e "TZ=$tz")
 
+clip_args=()
+while IFS= read -r arg; do clip_args+=("$arg"); done < <(clipboard_args)
+
 run=(
   docker run --rm -it -w "$PWD"
   ${tz_args[@]+"${tz_args[@]}"}
+  ${clip_args[@]+"${clip_args[@]}"}
   -v "$CARREL_HOME/claude":/home/claude/.claude
   -v "$CARREL_HOME/claude.json":/home/claude/.claude.json
   -v "${CARREL_IMAGE}-claude":/home/claude/.local/share/claude
