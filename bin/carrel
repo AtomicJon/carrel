@@ -6,63 +6,681 @@
 # your real ~/.claude. Selected config files are synced in on each launch;
 # session history and credentials stay in CARREL_HOME. The project is mounted at
 # its real host path so Claude's session IDs match a native run.
+#
+# Behaviour is driven by a JSON config resolved from four layers — see the
+# "Configuration" section below and `carrel config --help`.
 
 set -euo pipefail
 
+# The one setting that can't live in the config file: it's what locates it.
 CARREL_HOME="${CARREL_HOME:-$HOME/.carrel}"
-CARREL_IMAGE="${CARREL_IMAGE:-carrel}"
 
-# Config pulled from your real ~/.claude on each run. Credentials and session
-# history are deliberately excluded. settings.json is handled separately (see
-# sync_settings) because it needs a path fixup.
-SYNC_ITEMS=(CLAUDE.md skills agents output-styles statusline-command.sh notify.sh)
+VARIANTS=(base rust tauri)
 
-# Extra host items to pass into the container, on top of the project itself.
-# Populated from $CARREL_HOME/mounts and any -m/--mount flags. Each entry is a
-# spec: HOST[:CONTAINER][:ro|:rw] — see resolve_mount below.
-EXTRA_MOUNTS=()
+# Every recognised config key. Anything else in a config file is ignored with a
+# warning, and rejected outright by `carrel config set`.
+CONFIG_KEYS=(variant image tz clipboard mounts sync)
 
-# Whether to give the container a line to the host clipboard. Off unless asked
-# for, via --clipboard or CARREL_CLIPBOARD=1 — see clipboard_args.
-CLIPBOARD="${CARREL_CLIPBOARD:-0}"
+# Fallbacks for keys no config file sets. Unlike the file layers, these never
+# contribute to array concatenation — a config that sets `sync` replaces this
+# list rather than appending to it.
+# `tz` has no default on purpose: unset means "detect the host's", which
+# host_timezone does at launch.
+DEFAULT_CONFIG='{
+  "variant": "base",
+  "image": "carrel",
+  "clipboard": false,
+  "mounts": [],
+  "sync": ["CLAUDE.md", "skills", "agents", "output-styles",
+           "statusline-command.sh", "notify.sh"]
+}'
 
 # Where the host's Wayland socket lands inside the container.
 CLIPBOARD_SOCKET=/run/carrel/wayland.sock
 
+die() {
+  echo "carrel: $*" >&2
+  exit 1
+}
+
 usage() {
-  cat <<'EOF'
+  local variants="${VARIANTS[*]}"
+  cat <<EOF
 carrel — run an isolated, containerised Claude Code in the current project.
 
 Usage:
-  carrel [variant] [claude args...]   run Claude   (variant: base|rust|tauri)
+  carrel [variant] [claude args...]   run Claude   (variant: ${variants// /|})
   carrel shell [variant]              open a shell instead of Claude
+  carrel config <cmd>                 read/write settings (see below)
+  carrel trust                        review and trust this repo's .carrel.json
   carrel sync                         sync host config into carrel's dir
   carrel sessions [path]              print a project's session directory
   carrel -h | --help
 
 Args after the optional variant go straight to claude, e.g.:
   carrel --resume <id>     carrel rust -c     carrel -p "summarise this repo"
+Everything after -- goes to claude as-is:  carrel -- --help
 
-Extra mounts:
+Options (each overrides the config file for one run):
   -m, --mount SPEC   pass an extra host item into the container (repeatable).
                      SPEC is HOST[:CONTAINER][:ro|:rw]; read-only by default.
-                     Standing mounts live in $CARREL_HOME/mounts (one per line).
-  e.g. carrel -m ~/.ssh:/home/claude/.ssh -m ~/.gitconfig:/home/claude/.gitconfig
-
-Clipboard:
-  --clipboard        forward the host's Wayland clipboard, so Ctrl-V can paste
+      --image NAME   image name / tag prefix
+      --tz ZONE      container timezone
+      --clipboard    forward the host's Wayland clipboard, so Ctrl-V can paste
                      images into Claude. Off by default (it hands the agent your
-                     clipboard). Wayland only. CARREL_CLIPBOARD=1 makes it
-                     standing.
-  --no-clipboard     override a standing CARREL_CLIPBOARD=1 for one run.
+                     clipboard). Wayland only.
+      --no-clipboard turn it back off for one run
+      --dry-run      print the docker command that would run, and exit
+
+Config:
+  carrel config get [KEY] [--show-origin]   effective settings
+  carrel config set   [--project] KEY VALUE...
+  carrel config add   [--project] KEY VALUE     append to mounts / sync
+  carrel config unset [--project] KEY
+  carrel config path  [--project]               file that set/add would write
+
+  Keys: ${CONFIG_KEYS[*]}
+
+  Resolved highest-precedence first:
+    1. the options above
+    2. \$CARREL_HOME/projects/<slug>.json    your settings for this project
+    3. <project root>/.carrel.json          the repo's: restricted, and only
+                                            used once you've trusted it
+    4. \$CARREL_HOME/config.json             your global defaults
+  Scalars override; mounts and sync accumulate across layers.
 
 Env:
   CARREL_HOME       config dir on the host    (default: ~/.carrel)
-  CARREL_IMAGE      image name / tag prefix   (default: carrel)
-  CARREL_TZ         container timezone        (default: the host's)
-  CARREL_CLIPBOARD  1 to forward the clipboard by default
+
+Requires: docker, jq.
 EOF
 }
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 ||
+    die "jq is required to read the config (apt install jq / brew install jq)"
+}
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+# The project this run is about: the git repo we're inside, else the working
+# directory. It anchors both the repo config's location and the slug that names
+# your per-project config, so `carrel` behaves the same from any subdirectory.
+project_root() {
+  if [ -z "${PROJECT_ROOT:-}" ]; then
+    PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$PWD"
+  fi
+  printf '%s' "$PROJECT_ROOT"
+}
+
+# The project root with slashes turned to dashes — Claude's session-dir scheme.
+project_slug() {
+  local root
+  root="$(project_root)"
+  printf '%s' "${root//\//-}"
+}
+
+config_global_file() { printf '%s/config.json' "$CARREL_HOME"; }
+
+# Kept beside $CARREL_HOME/claude rather than inside it: that directory is
+# bind-mounted into the container, and your per-project settings are yours.
+config_project_file() { printf '%s/projects/%s.json' "$CARREL_HOME" "$(project_slug)"; }
+
+# Empty when there's no repo config to read. $HOME is excluded: a stray
+# ~/.carrel.json is a global config in disguise, not a project's.
+config_repo_file() {
+  local root
+  root="$(project_root)"
+  [ "$root" = "$HOME" ] && return 0
+  [ -f "$root/.carrel.json" ] || return 0
+  printf '%s/.carrel.json' "$root"
+}
+
+config_scope_file() {
+  case "$1" in
+    project) config_project_file ;;
+    *) config_global_file ;;
+  esac
+}
+
+config_type() {
+  case "$1" in
+    variant | image | tz) printf 'string' ;;
+    clipboard) printf 'bool' ;;
+    mounts | sync) printf 'array' ;;
+    *) return 1 ;;
+  esac
+}
+
+# {key: type} for every recognised key, as JSON.
+config_types() {
+  local key
+  for key in "${CONFIG_KEYS[@]}"; do
+    printf '%s\t%s\n' "$key" "$(config_type "$key")"
+  done | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add'
+}
+
+# Shared by the check and the filter below: whether a value fits its key's type.
+CONFIG_VALID_DEF='
+  def valid($kind):
+    if $kind == "bool" then type == "boolean"
+    elif $kind == "array" then type == "array" and all(.[]; type == "string")
+    else type == "string" end;'
+
+# A config file as a JSON object on stdout, or {} if it's missing, unparseable,
+# or not a single object. Unknown keys and wrongly typed values are dropped, so a
+# typo can't silently ride along in the merge — and a repo can't dodge a check
+# on `clipboard: true` by writing `["true"]`.
+read_config_file() {
+  local file="$1" json types key problem
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    printf '{}'
+    return 0
+  fi
+
+  if ! json="$(jq -e -s 'select(length == 1 and (.[0] | type) == "object") | .[0]' \
+    "$file" 2>/dev/null)"; then
+    echo "carrel: ignoring $file — not a single JSON object" >&2
+    printf '{}'
+    return 0
+  fi
+
+  types="$(config_types)"
+  while IFS=$'\t' read -r key problem; do
+    [ -n "$key" ] || continue
+    if [ "$problem" = unknown ]; then
+      echo "carrel: ignoring unknown key '$key' in $file" >&2
+    else
+      echo "carrel: ignoring '$key' in $file (expected $problem)" >&2
+    fi
+  done < <(printf '%s' "$json" | jq -r --argjson types "$types" "$CONFIG_VALID_DEF"'
+    to_entries[]
+    | $types[.key] as $type
+    | if $type == null then [.key, "unknown"]
+      elif (.value | valid($type)) then empty
+      else [.key, {bool: "true or false", array: "a list of strings",
+                   string: "a string"}[$type]]
+      end
+    | @tsv')
+
+  printf '%s' "$json" | jq --argjson types "$types" "$CONFIG_VALID_DEF"'
+    with_entries(select($types[.key] as $type
+                        | $type != null and (.value | valid($type))))'
+}
+
+# Whether a repo-committed config may ask for this mount.
+#
+# A .carrel.json arrives with the code — including from a repo you've only just
+# cloned — so it gets to share what's inherently local to the project and
+# nothing else. Named volumes (no host state) and paths inside the project pass;
+# ~, $VARs, and anything resolving outside the project root don't. realpath runs
+# on both sides, so a symlink planted in the repo can't point out of it.
+mount_is_shareable() {
+  local spec="$1" root="$2" host resolved
+
+  spec="${spec%:ro}"
+  spec="${spec%:rw}"
+  host="${spec%%:*}"
+
+  case "$host" in
+    '~'* | *'$'*) return 1 ;;
+  esac
+
+  case "$host" in
+    /* | ./* | ../*) ;;
+    *) return 0 ;; # a named volume
+  esac
+
+  [[ "$host" == /* ]] || host="$root/$host"
+  resolved="$(realpath -m "$host" 2>/dev/null)" || return 1
+  root="$(realpath -m "$root" 2>/dev/null)" || return 1
+  [ "$resolved" = "$root" ] || [[ "$resolved" == "$root"/* ]]
+}
+
+# A repo config as a JSON object, with everything it isn't allowed to set
+# stripped out. Each removal is reported, so a repo asking for more than it can
+# have is visible rather than silently ignored.
+repo_config_restricted() {
+  local file="$1" json root spec kept=()
+  json="$(read_config_file "$file")"
+  root="$(project_root)"
+
+  # `sync` selects files out of your real ~/.claude — never a repo's call.
+  if [ "$(printf '%s' "$json" | jq 'has("sync")')" = true ]; then
+    echo "carrel: ignoring 'sync' in $file (only you can choose what's synced)" >&2
+    json="$(printf '%s' "$json" | jq 'del(.sync)')"
+  fi
+
+  # Turning the clipboard off is a hint; turning it on is a decision.
+  if [ "$(printf '%s' "$json" | jq '.clipboard == true')" = true ]; then
+    echo "carrel: ignoring 'clipboard: true' in $file (only you can turn it on)" >&2
+    json="$(printf '%s' "$json" | jq 'del(.clipboard)')"
+  fi
+
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    if mount_is_shareable "$spec" "$root"; then
+      kept+=("$spec")
+    else
+      echo "carrel: skipping mount '$spec' in $file (outside the project);" \
+        "add it with 'carrel config add --project mounts $spec'" >&2
+    fi
+  done < <(printf '%s' "$json" | jq -r '.mounts[]? // empty')
+
+  printf '%s' "$json" | jq --arg kept "$(printf '%s\n' ${kept[@]+"${kept[@]}"})" \
+    'if has("mounts")
+       then .mounts = ($kept | split("\n") | map(select(length > 0)))
+       else . end'
+}
+
+# The repo's config, restricted, and only once you've trusted it. Restrictions
+# alone can't make a repo config safe — a mount can land anywhere in the
+# container, including over the `claude` binary — so an unreviewed file is shown
+# to you first. With no terminal to ask on, it's skipped rather than applied.
+read_repo_config() {
+  local file json
+  file="$(config_repo_file)"
+  if [ -z "$file" ]; then
+    printf '{}'
+    return 0
+  fi
+
+  json="$(repo_config_restricted "$file")"
+  if repo_config_trusted "$file"; then
+    printf '%s' "$json"
+    return 0
+  fi
+
+  if [ "${CONFIG_PROMPT:-0}" = 1 ] && confirm_repo_config "$file" "$json"; then
+    trust_repo_config "$file"
+    printf '%s' "$json"
+    return 0
+  fi
+
+  echo "carrel: not using $file until you trust it (review it with 'carrel trust')" >&2
+  printf '{}'
+}
+
+# ─── Repo config trust ────────────────────────────────────────────────────────
+
+# Trust is keyed on the file's content, so any change to it — a pull, a branch
+# switch — puts it back in front of you.
+file_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+trust_file() { printf '%s/projects/%s.trusted' "$CARREL_HOME" "$(project_slug)"; }
+
+repo_config_trusted() {
+  local trusted
+  trusted="$(trust_file)"
+  [ -f "$trusted" ] && [ "$(cat "$trusted")" = "$(file_hash "$1")" ]
+}
+
+trust_repo_config() {
+  local trusted
+  trusted="$(trust_file)"
+  mkdir -p "$(dirname "$trusted")"
+  file_hash "$1" >"$trusted"
+}
+
+# What a repo config will do, one line per setting, with each mount resolved to
+# the host path or volume it actually exposes.
+describe_repo_config() {
+  local json="$1" key value spec resolved rest host container access
+  while IFS=$'\t' read -r key value; do
+    printf '    %-9s %s\n' "$key" "$value"
+  done < <(printf '%s' "$json" |
+    jq -r 'del(.mounts) | to_entries[] | [.key, (.value | tostring)] | @tsv')
+
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    if ! resolved="$(resolve_mount "$spec" 2>/dev/null)"; then
+      printf '    %-9s %s (will be skipped)\n' mount "$spec"
+      continue
+    fi
+    rest="${resolved%:*}"
+    host="${rest%%:*}"
+    container="${rest#*:}"
+    access=read-only
+    [ "${resolved##*:}" = rw ] && access=read-write
+    [[ "$host" == /* ]] || host="volume $host"
+    printf '    %-9s %s -> %s (%s)\n' mount "$host" "$container" "$access"
+  done < <(printf '%s' "$json" | jq -r '.mounts[]? // empty')
+
+  if [ "$(printf '%s' "$json" | jq 'length')" = 0 ]; then
+    echo "    (nothing carrel will apply)"
+  fi
+}
+
+# Show a repo config and ask whether to trust it. Everything goes to stderr and
+# the answer comes from stdin, since this runs inside a command substitution.
+confirm_repo_config() {
+  local file="$1" json="$2" reply
+  {
+    if [ -f "$(trust_file)" ]; then
+      echo "carrel: $file has changed since you trusted it. It now asks for:"
+    else
+      echo "carrel: $file hasn't been reviewed yet. It asks for:"
+    fi
+    describe_repo_config "$json"
+    printf 'carrel: trust it and continue? [y/N] '
+  } >&2
+  read -r reply || return 1
+  case "$reply" in
+    y | Y | yes) return 0 ;;
+  esac
+  return 1
+}
+
+cmd_trust() {
+  local file json
+  file="$(config_repo_file)"
+  [ -n "$file" ] || die "no .carrel.json in $(project_root)"
+  json="$(repo_config_restricted "$file")"
+
+  if [ -t 0 ]; then
+    confirm_repo_config "$file" "$json" || die "not trusted"
+  else
+    echo "carrel: trusting $file, which asks for:"
+    describe_repo_config "$json"
+  fi
+  trust_repo_config "$file"
+  echo "carrel: trusted $file"
+}
+
+# Every layer, lowest precedence first, as [{label, config}, …]. The defaults
+# layer is first and is labelled so `--show-origin` can name it.
+config_layers() {
+  local global repo project
+  global="$(config_global_file)"
+  repo="$(config_repo_file)"
+  project="$(config_project_file)"
+
+  jq -n \
+    --argjson defaults "$DEFAULT_CONFIG" \
+    --arg globalLabel "$global" --argjson globalConfig "$(read_config_file "$global")" \
+    --arg repoLabel "${repo:-(none)}" --argjson repoConfig "$(read_repo_config)" \
+    --arg projectLabel "$project" --argjson projectConfig "$(read_config_file "$project")" \
+    '[{label: "(default)", config: $defaults},
+      {label: $globalLabel, config: $globalConfig},
+      {label: $repoLabel, config: $repoConfig},
+      {label: $projectLabel, config: $projectConfig}]'
+}
+
+# Fold the file layers together — later layers replace scalars and extend
+# arrays — then backfill anything untouched from the defaults.
+CONFIG_MERGE_FILTER='
+  .[0].config + (.[1:] | reduce .[] as $layer ({};
+    reduce ($layer.config | to_entries[]) as $entry (.;
+      if ($entry.value | type) == "array"
+        then .[$entry.key] = ((.[$entry.key] // []) + $entry.value)
+        else .[$entry.key] = $entry.value
+      end)))'
+
+# Resolve every layer into CONFIG_LAYERS and CONFIG_MERGED. Call this from the
+# main shell before any config_get: reading the layers is where warnings are
+# emitted, and doing it once keeps a repo config's complaints from repeating per
+# lookup. Subshells inherit the resolved values, so they never re-read.
+config_load() {
+  [ -n "${CONFIG_MERGED:-}" ] && return 0
+  PROJECT_ROOT="$(project_root)"
+  CONFIG_LAYERS="$(config_layers)"
+  CONFIG_MERGED="$(printf '%s' "$CONFIG_LAYERS" | jq "$CONFIG_MERGE_FILTER")"
+}
+
+config_merged() { printf '%s' "${CONFIG_MERGED:-}"; }
+
+# One key's effective value on stdout — array keys one element per line, absent
+# and empty keys nothing at all.
+config_get() {
+  config_merged | jq -r --arg key "$1" '
+    .[$key]
+    | if . == null then empty
+      elif type == "array" then .[]
+      else . end'
+}
+
+# ─── carrel config ────────────────────────────────────────────────────────────
+
+# Rewrite one key in a config file, creating it (and $CARREL_HOME/projects) on
+# first write. Written via a temp file so an interrupted jq can't truncate a
+# config you already had.
+config_write() {
+  local file="$1" filter="$2" tmp
+  shift 2
+
+  mkdir -p "$(dirname "$file")"
+  [ -f "$file" ] || printf '{}\n' >"$file"
+
+  tmp="$(mktemp "$file.XXXXXX")"
+  if jq "$@" "$filter" "$file" >"$tmp"; then
+    chmod 644 "$tmp"
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    die "failed to write $file"
+  fi
+}
+
+is_variant() {
+  local variant
+  for variant in "${VARIANTS[@]}"; do
+    [ "$1" = "$variant" ] && return 0
+  done
+  return 1
+}
+
+config_validate() {
+  local key="$1" value="$2"
+  case "$key" in
+    variant)
+      is_variant "$value" || die "unknown variant '$value' (want: ${VARIANTS[*]})"
+      ;;
+    clipboard)
+      case "$value" in
+        true | false) return 0 ;;
+        *) die "clipboard takes true or false, not '$value'" ;;
+      esac
+      ;;
+  esac
+}
+
+config_cmd_set() {
+  local scope="$1" key="$2" type file joined
+  shift 2
+  type="$(config_type "$key")" || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
+  [ "$#" -gt 0 ] || die "config set needs a value for '$key'"
+  file="$(config_scope_file "$scope")"
+
+  case "$type" in
+    array)
+      joined="$(printf '%s\n' "$@")"
+      config_write "$file" \
+        '.[$key] = ($value | split("\n") | map(select(length > 0)))' \
+        --arg key "$key" --arg value "$joined"
+      ;;
+    bool)
+      [ "$#" -eq 1 ] || die "'$key' takes a single value"
+      config_validate "$key" "$1"
+      config_write "$file" '.[$key] = ($value == "true")' \
+        --arg key "$key" --arg value "$1"
+      ;;
+    string)
+      [ "$#" -eq 1 ] || die "'$key' takes a single value"
+      config_validate "$key" "$1"
+      config_write "$file" '.[$key] = $value' --arg key "$key" --arg value "$1"
+      ;;
+  esac
+
+  echo "carrel: set $key in $file"
+}
+
+config_cmd_add() {
+  local scope="$1" key="$2" type file
+  shift 2
+  type="$(config_type "$key")" || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
+  [ "$type" = array ] || die "'$key' isn't a list — use 'carrel config set'"
+  [ "$#" -gt 0 ] || die "config add needs a value for '$key'"
+  file="$(config_scope_file "$scope")"
+
+  config_write "$file" \
+    '.[$key] = ((.[$key] // []) + ($value | split("\n") | map(select(length > 0))))' \
+    --arg key "$key" --arg value "$(printf '%s\n' "$@")"
+
+  echo "carrel: added to $key in $file"
+}
+
+config_cmd_unset() {
+  local scope="$1" key="$2" file
+  config_type "$key" >/dev/null || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
+  file="$(config_scope_file "$scope")"
+  [ -f "$file" ] || die "no config at $file"
+  config_write "$file" 'del(.[$key])' --arg key "$key"
+  echo "carrel: unset $key in $file"
+}
+
+# Attribute each effective value to the layer that supplied it. Array keys list
+# one line per element, since a list is assembled from several layers at once.
+CONFIG_ORIGIN_FILTER='
+  def rows($value; $label):
+    if ($value | type) == "array"
+      then $value | map({value: (. | tostring), label: $label})
+      else [{value: ($value | tostring), label: $label}]
+    end;
+
+  .[0].config as $defaults
+  | (.[1:] | reduce .[] as $layer ({};
+      reduce ($layer.config | to_entries[]) as $entry (.;
+        if ($entry.value | type) == "array"
+          then .[$entry.key] = ((.[$entry.key] // [])
+                                + rows($entry.value; $layer.label))
+          else .[$entry.key] = rows($entry.value; $layer.label)
+        end))) as $set
+  | (($defaults | keys) + ($set | keys) | unique)
+  | map(. as $key
+        | (if $set | has($key) then $set[$key]
+           else rows($defaults[$key]; "(default)") end)
+        | map([$key, .value, .label]))
+  | (add // [])[]
+  | @tsv'
+
+config_cmd_get() {
+  local show_origin="$1" key="${2:-}" key_name value label
+
+  if [ -n "$key" ]; then
+    config_type "$key" >/dev/null || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
+    if [ "$show_origin" = 1 ]; then
+      printf '%s' "$CONFIG_LAYERS" | jq -r "$CONFIG_ORIGIN_FILTER" |
+        while IFS=$'\t' read -r key_name value label; do
+          if [ "$key_name" = "$key" ]; then
+            printf '  %-24s %s\n' "$value" "$label"
+          fi
+        done
+    else
+      config_get "$key"
+    fi
+    return 0
+  fi
+
+  if [ "$show_origin" = 1 ]; then
+    printf '%s' "$CONFIG_LAYERS" | jq -r "$CONFIG_ORIGIN_FILTER" |
+      while IFS=$'\t' read -r key_name value label; do
+        printf '  %-10s %-40s %s\n' "$key_name" "$value" "$label"
+      done
+  else
+    config_merged | jq -r '
+      to_entries[]
+      | .key as $key
+      | if (.value | type) == "array"
+          then (.value[] | [$key, .])
+          else [$key, (.value | tostring)]
+        end
+      | @tsv' |
+      while IFS=$'\t' read -r key_name value; do
+        printf '  %-10s %s\n' "$key_name" "$value"
+      done
+  fi
+}
+
+cmd_config() {
+  local action="${1:-get}" scope=global show_origin=0 args=()
+  [ "$#" -gt 0 ] && shift
+  config_load
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --project) scope=project ;;
+      --global) scope=global ;;
+      --show-origin) show_origin=1 ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- ${args[@]+"${args[@]}"}
+
+  case "$action" in
+    get | path) ;;
+    set | add | unset) [ "$#" -gt 0 ] || die "config $action needs a key" ;;
+    *) die "unknown config command '$action' (want: get set add unset path)" ;;
+  esac
+
+  case "$action" in
+    get) config_cmd_get "$show_origin" "${1:-}" ;;
+    set) config_cmd_set "$scope" "$1" "${@:2}" ;;
+    add) config_cmd_add "$scope" "$1" "${@:2}" ;;
+    unset) config_cmd_unset "$scope" "$1" ;;
+    path)
+      config_scope_file "$scope"
+      echo
+      ;;
+  esac
+}
+
+# One-shot upgrade from the line-oriented $CARREL_HOME/mounts file that config.json
+# replaced. Runs only while no global config exists, and renames the old file so
+# it can't run twice.
+migrate_mounts_file() {
+  local old="$CARREL_HOME/mounts" new line specs=()
+  new="$(config_global_file)"
+  [ -f "$old" ] || return 0
+  [ -f "$new" ] && return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "${line#"${line%%[![:space:]]*}"}" in
+      '' | '#'*) continue ;;
+    esac
+    specs+=("$line")
+  done <"$old"
+
+  config_write "$new" \
+    '.mounts = ($value | split("\n") | map(select(length > 0)))' \
+    --arg value "$(printf '%s\n' ${specs[@]+"${specs[@]}"})"
+  mv "$old" "$old.migrated"
+  echo "carrel: moved ${#specs[@]} mount(s) from $old into $new" >&2
+  echo "carrel: the old file is now $old.migrated and is no longer read" >&2
+}
+
+# The env vars that config.json replaced. Nothing reads them any more, so say so
+# rather than let a stale `export` in a shell rc quietly stop working.
+warn_legacy_env() {
+  if [ -n "${CARREL_IMAGE:-}" ]; then
+    echo "carrel: CARREL_IMAGE is no longer read; use --image or 'carrel config set image $CARREL_IMAGE'" >&2
+  fi
+  if [ -n "${CARREL_TZ:-}" ]; then
+    echo "carrel: CARREL_TZ is no longer read; use --tz or 'carrel config set tz $CARREL_TZ'" >&2
+  fi
+  if [ -n "${CARREL_CLIPBOARD:-}" ]; then
+    echo "carrel: CARREL_CLIPBOARD is no longer read; use --clipboard or 'carrel config set clipboard true'" >&2
+  fi
+}
+
+# ─── Launching ────────────────────────────────────────────────────────────────
 
 # settings.json, with a path fixup. Commands it runs (statusLine, hooks) point at
 # scripts by their host path under ~/.claude, which is mounted at
@@ -86,9 +704,9 @@ sync_settings() {
   fi
 }
 
-# One-way host -> carrel config sync. Symlinks (e.g. dotfiles) are dereferenced
-# so the container sees real files, not dangling links. Only changed files are
-# copied, and each one is printed.
+# One-way host -> carrel config sync, over the items the `sync` key names.
+# Symlinks (e.g. dotfiles) are dereferenced so the container sees real files, not
+# dangling links. Only changed files are copied, and each one is printed.
 do_sync() {
   mkdir -p "$CARREL_HOME/claude"
   # Guard against a stray directory at this path (Docker creates one if the file
@@ -98,25 +716,33 @@ do_sync() {
   fi
   [ -f "$CARREL_HOME/claude.json" ] || echo '{}' >"$CARREL_HOME/claude.json"
 
-  local dst="$CARREL_HOME/claude" i src
-  for i in "${SYNC_ITEMS[@]}"; do
-    src="$HOME/.claude/$i"
+  local dst="$CARREL_HOME/claude" item src
+  while IFS= read -r item; do
+    [ -n "$item" ] || continue
+    # Items are deleted and replaced below, so they must stay inside ~/.claude.
+    case "/$item/" in
+      //* | */./* | */../*)
+        echo "carrel: skipping sync item '$item' (must be a path inside ~/.claude)" >&2
+        continue
+        ;;
+    esac
+    src="$HOME/.claude/$item"
     [ -e "$src" ] || continue
     if command -v rsync >/dev/null 2>&1; then
       # -aL: archive + dereference symlinks. --delete (scoped to this item's own
       # directory, never the whole config dir) mirrors host-side removals.
       # --out-format prints only what changed.
       if [ -d "$src" ]; then
-        rsync -aL --delete --out-format="  synced $i/%n" "$src/" "$dst/$i/"
+        rsync -aL --delete --out-format="  synced $item/%n" "$src/" "$dst/$item/"
       else
         rsync -aL --out-format='  synced %n' "$src" "$dst/"
       fi
     else
       # Fallback when rsync isn't installed: full replace, no change detection.
-      rm -rf "$dst/$i"
-      cp -RL "$src" "$dst/$i" && echo "  synced $i"
+      rm -rf "${dst:?}/$item"
+      cp -RL "$src" "$dst/$item" && echo "  synced $item"
     fi
-  done
+  done < <(config_get sync)
 
   sync_settings
 }
@@ -125,11 +751,11 @@ do_sync() {
 # host:container:mode string for `docker -v`, printed on stdout. Returns non-zero
 # (and prints nothing) when the spec should be skipped; diagnostics go to stderr.
 #
-# HOST is a host path (leading ~ and $VARs expanded) or a Docker named volume
-# (no leading /). CONTAINER defaults to HOST's path when omitted, but is required
-# for named volumes. Mode defaults to ro — an autonomous agent runs in here, so
-# writes are opt-in per mount. Specs are never eval'd, so a config line can't
-# inject shell.
+# HOST is a host path (leading ~ and $VARs expanded, ./ and ../ resolved against
+# the project root) or a Docker named volume (anything else). CONTAINER defaults
+# to HOST's path when omitted, but is required for named volumes. Mode defaults
+# to ro — an autonomous agent runs in here, so writes are opt-in per mount.
+# Specs are never eval'd, so a config line can't inject shell.
 resolve_mount() {
   local spec="$1" mode host container
 
@@ -162,6 +788,12 @@ resolve_mount() {
     host="${host//\$$name/${!name-}}"
   done
 
+  # Relative specs are the repo-config idiom (./fixtures:/opt/fixtures), so they
+  # anchor to the project, not to wherever you happened to run carrel.
+  case "$host" in
+    ./* | ../*) host="$(realpath -m "$(project_root)/$host")" ;;
+  esac
+
   if [[ "$host" == /* ]]; then
     # Bind mount. Default the container path to the host path (the $PWD pattern).
     [ -n "$container" ] || container="$host"
@@ -180,27 +812,14 @@ resolve_mount() {
   printf '%s:%s:%s' "$host" "$container" "$mode"
 }
 
-# Load standing mount specs from $CARREL_HOME/mounts into EXTRA_MOUNTS. Blank
-# lines and #-comment lines are ignored.
-load_mount_file() {
-  local file="$CARREL_HOME/mounts" line
-  [ -f "$file" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "${line#"${line%%[![:space:]]*}"}" in
-      '' | '#'*) continue ;;
-    esac
-    EXTRA_MOUNTS+=("$line")
-  done <"$file"
-}
-
 # The host's IANA timezone name, printed on stdout (empty if it can't be
 # determined). Debian's clock is UTC, so without this every timestamp the agent
 # sees (file mtimes, git dates, the status line's usage-reset time) is offset
-# from the wall clock. CARREL_TZ overrides; /etc/timezone is Debian-style, the
-# /etc/localtime symlink covers the rest (systemd distros, macOS).
+# from the wall clock. The `tz` config key overrides; /etc/timezone is
+# Debian-style, the /etc/localtime symlink covers the rest (systemd, macOS).
 host_timezone() {
-  if [ -n "${CARREL_TZ:-}" ]; then
-    printf '%s' "$CARREL_TZ"
+  if [ -n "${TZ_OVERRIDE:-}" ]; then
+    printf '%s' "$TZ_OVERRIDE"
     return 0
   fi
   if [ -n "${TZ:-}" ]; then
@@ -238,10 +857,10 @@ host_timezone() {
 # GNOME doesn't expose the clipboard to Wayland clients at all, so nothing to
 # forward there.
 clipboard_args() {
-  [ "$CLIPBOARD" = 1 ] || return 0
+  [ "$CLIPBOARD" = true ] || return 0
 
   if [ -z "${WAYLAND_DISPLAY:-}" ]; then
-    echo "carrel: --clipboard needs a Wayland session (WAYLAND_DISPLAY is unset); continuing without it" >&2
+    echo "carrel: clipboard needs a Wayland session (WAYLAND_DISPLAY is unset); continuing without it" >&2
     return 0
   fi
 
@@ -250,7 +869,7 @@ clipboard_args() {
   [[ "$sock" == /* ]] || sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$sock"
 
   if [ ! -S "$sock" ]; then
-    echo "carrel: --clipboard found no Wayland socket at $sock; continuing without it" >&2
+    echo "carrel: clipboard found no Wayland socket at $sock; continuing without it" >&2
     return 0
   fi
 
@@ -263,50 +882,85 @@ session_dir() {
   printf '%s/claude/projects/%s\n' "$CARREL_HOME" "${p//\//-}"
 }
 
-launch=claude
-case "${1:-}" in
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  sync)
-    do_sync
-    exit 0
-    ;;
-  sessions)
-    shift
-    session_dir "${1:-$PWD}"
-    exit 0
-    ;;
-  shell)
-    launch=shell
-    shift
-    ;;
-esac
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
-# Standing mounts from the config file load first, then any -m/--mount flags
-# append — so a flag adds to (rather than replaces) the standing set.
-load_mount_file
+# Help needs neither jq nor a config, so answer it before either is touched.
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+done
 
-# Pull -m/--mount flags out of the remaining args (they can sit anywhere among
-# the claude args); everything else passes through to claude untouched.
+require_jq
+warn_legacy_env
+migrate_mounts_file
+
+# `config` takes its own flags (--project, --show-origin), so it's dispatched
+# before the launcher's flag parsing gets a look at them.
+if [ "${1:-}" = config ]; then
+  shift
+  cmd_config "$@"
+  exit 0
+fi
+
+# Pull carrel's own flags out of the args (they can sit anywhere — before or
+# after a subcommand, among the claude args); everything else passes through to
+# claude untouched. They're applied on top of the config once it's loaded.
+flag_image=""
+flag_tz=""
+flag_clipboard=""
+flag_mounts=()
+dry_run=0
 remaining=()
+passthrough=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --)
+      shift
+      passthrough=("$@")
+      break
+      ;;
     -m | --mount)
-      EXTRA_MOUNTS+=("${2:?carrel: --mount needs a spec}")
+      [ "$#" -ge 2 ] || die "--mount needs a spec"
+      flag_mounts+=("$2")
       shift 2
       ;;
     --mount=*)
-      EXTRA_MOUNTS+=("${1#--mount=}")
+      flag_mounts+=("${1#--mount=}")
+      shift
+      ;;
+    --image)
+      [ "$#" -ge 2 ] || die "--image needs a name"
+      flag_image="$2"
+      shift 2
+      ;;
+    --image=*)
+      flag_image="${1#--image=}"
+      shift
+      ;;
+    --tz)
+      [ "$#" -ge 2 ] || die "--tz needs a zone"
+      flag_tz="$2"
+      shift 2
+      ;;
+    --tz=*)
+      flag_tz="${1#--tz=}"
       shift
       ;;
     --clipboard)
-      CLIPBOARD=1
+      flag_clipboard=true
       shift
       ;;
     --no-clipboard)
-      CLIPBOARD=0
+      flag_clipboard=false
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
       shift
       ;;
     *)
@@ -317,14 +971,58 @@ while [ "$#" -gt 0 ]; do
 done
 set -- ${remaining[@]+"${remaining[@]}"}
 
-tag=base
-case "${1:-}" in base | rust | tauri)
-  tag="$1"
-  shift
-  ;;
+launch=claude
+case "${1:-}" in
+  sessions)
+    shift
+    session_dir "${1:-$PWD}"
+    exit 0
+    ;;
+  trust)
+    cmd_trust
+    exit 0
+    ;;
+  sync)
+    config_load
+    if [ "$dry_run" = 1 ]; then
+      echo "carrel: would sync from $HOME/.claude: $(config_get sync | tr '\n' ' ')settings.json"
+    else
+      do_sync
+    fi
+    exit 0
+    ;;
+  shell)
+    launch=shell
+    shift
+    ;;
 esac
 
-do_sync
+tag=""
+if is_variant "${1:-}"; then
+  tag="$1"
+  shift
+fi
+
+# This is the one place an unreviewed repo config is about to be acted on, so
+# it's the one place carrel asks about it — and only with someone there to ask.
+if [ -t 0 ] && [ -t 2 ]; then
+  CONFIG_PROMPT=1
+fi
+config_load
+
+IMAGE_NAME="${flag_image:-$(config_get image)}"
+CLIPBOARD="${flag_clipboard:-$(config_get clipboard)}"
+TZ_OVERRIDE="${flag_tz:-$(config_get tz)}"
+[ -n "$tag" ] || tag="$(config_get variant)"
+
+# -m adds to the configured mounts rather than replacing them.
+EXTRA_MOUNTS=()
+while IFS= read -r spec; do
+  [ -n "$spec" ] && EXTRA_MOUNTS+=("$spec")
+done < <(config_get mounts)
+EXTRA_MOUNTS+=(${flag_mounts[@]+"${flag_mounts[@]}"})
+
+[ "$dry_run" = 1 ] || do_sync
 
 mount_args=()
 for spec in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
@@ -345,15 +1043,23 @@ run=(
   ${clip_args[@]+"${clip_args[@]}"}
   -v "$CARREL_HOME/claude":/home/claude/.claude
   -v "$CARREL_HOME/claude.json":/home/claude/.claude.json
-  -v "${CARREL_IMAGE}-claude":/home/claude/.local/share/claude
-  -v "${CARREL_IMAGE}-node":/home/claude/.nvm/versions/node
+  -v "${IMAGE_NAME}-claude":/home/claude/.local/share/claude
+  -v "${IMAGE_NAME}-node":/home/claude/.nvm/versions/node
   -v "$PWD":"$PWD"
   ${mount_args[@]+"${mount_args[@]}"}
-  "${CARREL_IMAGE}:${tag}"
+  "${IMAGE_NAME}:${tag}"
 )
 
 if [ "$launch" = shell ]; then
-  exec "${run[@]}" bash
+  run+=(bash)
 else
-  exec "${run[@]}" claude "$@"
+  run+=(claude "$@" ${passthrough[@]+"${passthrough[@]}"})
 fi
+
+if [ "$dry_run" = 1 ]; then
+  printf '%q ' "${run[@]}"
+  printf '\n'
+  exit 0
+fi
+
+exec "${run[@]}"
