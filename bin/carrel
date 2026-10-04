@@ -74,10 +74,13 @@ Options (each overrides the config file for one run):
 
 Config:
   carrel config get [KEY] [--show-origin]   effective settings
-  carrel config set   [--project] KEY VALUE...
-  carrel config add   [--project] KEY VALUE     append to mounts / sync
-  carrel config unset [--project] KEY
-  carrel config path  [--project]               file that set/add would write
+  carrel config set   [--project|--repo] KEY VALUE...
+  carrel config add   [--project|--repo] KEY VALUE   append to mounts / sync
+  carrel config unset [--project|--repo] KEY
+  carrel config path  [--project|--repo]             file that set/add would write
+
+  --project writes your settings for this project; --repo writes the repo's
+  shared .carrel.json, within the limits a repo config has.
 
   Keys: ${CONFIG_KEYS[*]}
 
@@ -137,9 +140,18 @@ config_repo_file() {
   printf '%s/.carrel.json' "$root"
 }
 
+# Where `config --repo` writes, whether or not the file exists yet.
+config_repo_target() {
+  local root
+  root="$(project_root)"
+  [ "$root" = "$HOME" ] && die "not in a project, so there's no repo config to write"
+  printf '%s/.carrel.json' "$root"
+}
+
 config_scope_file() {
   case "$1" in
     project) config_project_file ;;
+    repo) config_repo_target ;;
     *) config_global_file ;;
   esac
 }
@@ -491,30 +503,76 @@ config_validate() {
   esac
 }
 
+# Refuse a repo-config write that carrel would only ignore on the next launch.
+config_check_repo_value() {
+  local key="$1" root spec
+  shift
+  root="$(project_root)"
+  case "$key" in
+    sync)
+      die "a repo config can't set 'sync' (only you can choose what's synced); use --project"
+      ;;
+    clipboard)
+      [ "$1" = true ] &&
+        die "a repo config can't turn the clipboard on; use --project"
+      ;;
+    mounts)
+      for spec in "$@"; do
+        mount_is_shareable "$spec" "$root" ||
+          die "a repo config can't mount '$spec' (outside the project); use --project"
+      done
+      ;;
+  esac
+  return 0
+}
+
+# config_write, plus trust upkeep for the repo config. An edit you make yourself
+# keeps a trusted (or brand new) file trusted, but never approves content you
+# hadn't already reviewed.
+config_write_scope() {
+  local scope="$1" file="$2" keep_trust=0
+  shift 2
+
+  if [ "$scope" = repo ] && { [ ! -f "$file" ] || repo_config_trusted "$file"; }; then
+    keep_trust=1
+  fi
+
+  config_write "$file" "$@"
+
+  if [ "$scope" = repo ]; then
+    if [ "$keep_trust" = 1 ]; then
+      trust_repo_config "$file"
+    else
+      echo "carrel: $file isn't trusted yet; review it with 'carrel trust'" >&2
+    fi
+  fi
+}
+
 config_cmd_set() {
   local scope="$1" key="$2" type file joined
   shift 2
   type="$(config_type "$key")" || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
   [ "$#" -gt 0 ] || die "config set needs a value for '$key'"
+  [ "$scope" = repo ] && config_check_repo_value "$key" "$@"
   file="$(config_scope_file "$scope")"
 
   case "$type" in
     array)
       joined="$(printf '%s\n' "$@")"
-      config_write "$file" \
+      config_write_scope "$scope" "$file" \
         '.[$key] = ($value | split("\n") | map(select(length > 0)))' \
         --arg key "$key" --arg value "$joined"
       ;;
     bool)
       [ "$#" -eq 1 ] || die "'$key' takes a single value"
       config_validate "$key" "$1"
-      config_write "$file" '.[$key] = ($value == "true")' \
+      config_write_scope "$scope" "$file" '.[$key] = ($value == "true")' \
         --arg key "$key" --arg value "$1"
       ;;
     string)
       [ "$#" -eq 1 ] || die "'$key' takes a single value"
       config_validate "$key" "$1"
-      config_write "$file" '.[$key] = $value' --arg key "$key" --arg value "$1"
+      config_write_scope "$scope" "$file" '.[$key] = $value' --arg key "$key" --arg value "$1"
       ;;
   esac
 
@@ -527,9 +585,10 @@ config_cmd_add() {
   type="$(config_type "$key")" || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
   [ "$type" = array ] || die "'$key' isn't a list — use 'carrel config set'"
   [ "$#" -gt 0 ] || die "config add needs a value for '$key'"
+  [ "$scope" = repo ] && config_check_repo_value "$key" "$@"
   file="$(config_scope_file "$scope")"
 
-  config_write "$file" \
+  config_write_scope "$scope" "$file" \
     '.[$key] = ((.[$key] // []) + ($value | split("\n") | map(select(length > 0))))' \
     --arg key "$key" --arg value "$(printf '%s\n' "$@")"
 
@@ -541,7 +600,7 @@ config_cmd_unset() {
   config_type "$key" >/dev/null || die "unknown key '$key' (want: ${CONFIG_KEYS[*]})"
   file="$(config_scope_file "$scope")"
   [ -f "$file" ] || die "no config at $file"
-  config_write "$file" 'del(.[$key])' --arg key "$key"
+  config_write_scope "$scope" "$file" 'del(.[$key])' --arg key "$key"
   echo "carrel: unset $key in $file"
 }
 
@@ -617,6 +676,7 @@ cmd_config() {
     case "$1" in
       --project) scope=project ;;
       --global) scope=global ;;
+      --repo) scope=repo ;;
       --show-origin) show_origin=1 ;;
       *) args+=("$1") ;;
     esac

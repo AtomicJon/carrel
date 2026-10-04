@@ -360,6 +360,45 @@ test_changed_repo_config_needs_trust_again() {
   assert_contains "$(carrel --dry-run 2>/dev/null)" "carrel:base"
 }
 
+test_repo_scope_writes_and_trusts_repo_config() {
+  mkdir -p "$PROJECT/.vmssh"
+  carrel config set --repo variant rust >/dev/null
+  carrel config add --repo mounts ./.vmssh:/home/claude/.ssh >/dev/null
+  [ -f "$PROJECT/.carrel.json" ] || fail "expected a repo config at $PROJECT/.carrel.json"
+  assert_equals "$(carrel config path --repo)" "$PROJECT/.carrel.json"
+
+  local out
+  out="$(carrel --dry-run 2>/dev/null)"
+  assert_contains "$out" "carrel:rust"
+  assert_contains "$out" "$PROJECT/.vmssh:/home/claude/.ssh:ro"
+
+  carrel config unset --repo variant >/dev/null
+  assert_contains "$(carrel --dry-run 2>/dev/null)" "carrel:base"
+}
+
+test_repo_scope_rejects_what_a_repo_cannot_set() {
+  local err
+  err="$(carrel config add --repo mounts ~/.ssh:/home/claude/.ssh 2>&1)" &&
+    fail "expected a nonzero exit"
+  assert_contains "$err" "outside the project"
+
+  err="$(carrel config set --repo clipboard true 2>&1)" && fail "expected a nonzero exit"
+  assert_contains "$err" "clipboard"
+
+  err="$(carrel config set --repo sync CLAUDE.md 2>&1)" && fail "expected a nonzero exit"
+  assert_contains "$err" "sync"
+
+  [ -f "$PROJECT/.carrel.json" ] && fail "expected no repo config to be written"
+}
+
+test_repo_scope_keeps_untrusted_config_untrusted() {
+  write_config "$PROJECT/.carrel.json" '{"image": "sketchy"}'
+  local err
+  err="$(carrel config set --repo variant rust 2>&1 >/dev/null)"
+  assert_contains "$err" "carrel trust"
+  assert_contains "$(carrel --dry-run 2>/dev/null)" "carrel:base"
+}
+
 test_config_help_succeeds() {
   local out
   out="$(carrel config --help)" || fail "expected a zero exit"
@@ -451,6 +490,9 @@ run_test "config flags reach config"         test_config_flags_are_not_eaten_by_
 run_test "untrusted repo config skipped"     test_untrusted_repo_config_is_skipped
 run_test "trust applies and lists"           test_trust_applies_repo_config_and_lists_it
 run_test "changed repo config needs trust"   test_changed_repo_config_needs_trust_again
+run_test "--repo writes and trusts"          test_repo_scope_writes_and_trusts_repo_config
+run_test "--repo rejects repo-only limits"   test_repo_scope_rejects_what_a_repo_cannot_set
+run_test "--repo keeps untrusted untrusted"  test_repo_scope_keeps_untrusted_config_untrusted
 run_test "config --help succeeds"            test_config_help_succeeds
 run_test "help works without jq"             test_help_works_without_jq
 run_test "help lists every variant"          test_help_lists_every_variant

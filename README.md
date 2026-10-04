@@ -143,6 +143,7 @@ carrel config get --show-origin         # …and which file each came from
 
 carrel config set variant rust          # global default
 carrel config set --project variant rust   # …for this project only
+carrel config set --repo variant rust      # …in the repo's shared .carrel.json
 carrel config add mounts ~/.ssh:/home/claude/.ssh   # append to a list
 carrel config unset --project variant
 carrel config path --project            # the file set/add would write
@@ -244,6 +245,20 @@ carrel: skipping mount '~/.ssh:/home/claude/.ssh' in /home/you/api/.carrel.json
         (outside the project); add it with
         'carrel config add --project mounts ~/.ssh:/home/claude/.ssh'
 ```
+
+To write a repo config, edit `.carrel.json` directly or use `--repo`, which
+works like `--project` but targets the shared file:
+
+```bash
+carrel config set --repo variant rust
+carrel config add --repo mounts ./fixtures:/opt/fixtures
+```
+
+`--repo` refuses anything a repo config can't grant (and points you at
+`--project` instead), so it never writes a setting that would just be ignored.
+Since you made the edit yourself, a file you'd already trusted, or a new one,
+stays trusted. A file you hadn't trusted yet stays untrusted until you review
+it with `carrel trust`.
 
 A typical repo config, with a shared pnpm store (a named volume, seeded empty)
 and a fixtures directory from the repo:
