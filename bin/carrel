@@ -704,44 +704,6 @@ cmd_config() {
   esac
 }
 
-# One-shot upgrade from the line-oriented $CARREL_HOME/mounts file that config.json
-# replaced. Runs only while no global config exists, and renames the old file so
-# it can't run twice.
-migrate_mounts_file() {
-  local old="$CARREL_HOME/mounts" new line specs=()
-  new="$(config_global_file)"
-  [ -f "$old" ] || return 0
-  [ -f "$new" ] && return 0
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "${line#"${line%%[![:space:]]*}"}" in
-      '' | '#'*) continue ;;
-    esac
-    specs+=("$line")
-  done <"$old"
-
-  config_write "$new" \
-    '.mounts = ($value | split("\n") | map(select(length > 0)))' \
-    --arg value "$(printf '%s\n' ${specs[@]+"${specs[@]}"})"
-  mv "$old" "$old.migrated"
-  echo "carrel: moved ${#specs[@]} mount(s) from $old into $new" >&2
-  echo "carrel: the old file is now $old.migrated and is no longer read" >&2
-}
-
-# The env vars that config.json replaced. Nothing reads them any more, so say so
-# rather than let a stale `export` in a shell rc quietly stop working.
-warn_legacy_env() {
-  if [ -n "${CARREL_IMAGE:-}" ]; then
-    echo "carrel: CARREL_IMAGE is no longer read; use --image or 'carrel config set image $CARREL_IMAGE'" >&2
-  fi
-  if [ -n "${CARREL_TZ:-}" ]; then
-    echo "carrel: CARREL_TZ is no longer read; use --tz or 'carrel config set tz $CARREL_TZ'" >&2
-  fi
-  if [ -n "${CARREL_CLIPBOARD:-}" ]; then
-    echo "carrel: CARREL_CLIPBOARD is no longer read; use --clipboard or 'carrel config set clipboard true'" >&2
-  fi
-}
-
 # ─── Launching ────────────────────────────────────────────────────────────────
 
 # settings.json, with a path fixup. Commands it runs (statusLine, hooks) point at
@@ -967,8 +929,6 @@ for arg in "$@"; do
 done
 
 require_jq
-warn_legacy_env
-migrate_mounts_file
 
 # `config` takes its own flags (--project, --show-origin), so it's dispatched
 # before the launcher's flag parsing gets a look at them.

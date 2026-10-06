@@ -298,17 +298,6 @@ test_tz_falls_back_to_the_host() {
   assert_contains "$(carrel --tz UTC --dry-run 2>/dev/null)" "TZ=UTC"
 }
 
-test_migrates_legacy_mounts_file() {
-  printf '# a comment\n\nvol-old:/mnt/old\n' >"$CARREL_HOME/mounts"
-
-  local err
-  err="$(carrel config get mounts 2>&1 >/dev/null)"
-  assert_contains "$err" "moved 1 mount(s)"
-  assert_equals "$(carrel config get mounts 2>/dev/null)" "vol-old:/mnt/old"
-  [ -f "$CARREL_HOME/mounts.migrated" ] || fail "expected the old file to be renamed"
-  [ -f "$CARREL_HOME/mounts" ] && fail "expected the old file to be gone"
-}
-
 test_claude_args_still_pass_through() {
   local out
   out="$(carrel --dry-run rust --resume abc123 -p hello 2>/dev/null)"
@@ -438,14 +427,6 @@ test_show_origin_warns_once() {
   assert_equals "$(printf '%s\n' "$err" | grep -c "unknown key 'bogus'")" "1"
 }
 
-test_legacy_env_vars_warn() {
-  local err
-  err="$(CARREL_IMAGE=old CARREL_TZ=UTC CARREL_CLIPBOARD=1 carrel --dry-run 2>&1 >/dev/null)"
-  assert_contains "$err" "CARREL_IMAGE is no longer read"
-  assert_contains "$err" "CARREL_TZ is no longer read"
-  assert_contains "$err" "CARREL_CLIPBOARD is no longer read"
-}
-
 test_double_dash_passes_the_rest_to_claude() {
   assert_contains "$(carrel --dry-run rust -- --help 2>/dev/null)" "carrel:rust claude --help"
 }
@@ -489,7 +470,6 @@ run_test "malformed file ignored"            test_malformed_file_is_ignored
 run_test "show-origin attributes values"     test_show_origin_attributes_each_value
 run_test "config reads from a subdirectory"  test_config_reads_from_a_subdirectory
 run_test "tz from config and flag"           test_tz_falls_back_to_the_host
-run_test "migrates legacy mounts file"       test_migrates_legacy_mounts_file
 run_test "claude args pass through"          test_claude_args_still_pass_through
 run_test "shell launches bash"               test_shell_launches_bash
 run_test "opencode launches opencode"        test_opencode_launches_opencode
@@ -506,7 +486,6 @@ run_test "help works without jq"             test_help_works_without_jq
 run_test "help lists every variant"          test_help_lists_every_variant
 run_test "every variant recognised"          test_every_variant_is_recognised
 run_test "show-origin warns once"            test_show_origin_warns_once
-run_test "legacy env vars warn"              test_legacy_env_vars_warn
 run_test "-- passes the rest to claude"      test_double_dash_passes_the_rest_to_claude
 run_test "sync --dry-run writes nothing"     test_sync_dry_run_writes_nothing
 run_test "sync stays inside ~/.claude"       test_sync_refuses_paths_outside_claude_dir
