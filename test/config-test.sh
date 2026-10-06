@@ -427,6 +427,62 @@ test_show_origin_warns_once() {
   assert_equals "$(printf '%s\n' "$err" | grep -c "unknown key 'bogus'")" "1"
 }
 
+test_worktree_mounts_main_git_dir() {
+  git -C "$PROJECT" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  git -C "$PROJECT" worktree add -q "$SANDBOX/wt"
+  cd "$SANDBOX/wt" || return
+  assert_contains "$(carrel --dry-run 2>/dev/null)" "$PROJECT/.git:$PROJECT/.git:rw"
+}
+
+test_relative_worktree_mounts_main_git_dir() {
+  git -C "$PROJECT" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  git -C "$PROJECT" worktree add -q --relative-paths "$SANDBOX/wt"
+  cd "$SANDBOX/wt" || return
+  assert_contains "$(carrel --dry-run 2>/dev/null)" "$PROJECT/.git:$PROJECT/.git:rw"
+}
+
+test_main_checkout_mounts_no_extra_git_dir() {
+  assert_not_contains "$(carrel --dry-run 2>/dev/null)" ".git:"
+}
+
+# A repo elsewhere on the host that a crafted .git tries to get mounted.
+make_victim_repo() {
+  VICTIM="$SANDBOX/victim"
+  git init -q "$VICTIM"
+}
+
+assert_no_victim_mount() {
+  local out
+  out="$(carrel --dry-run 2>/dev/null)"
+  assert_contains "$out" "docker run"
+  assert_not_contains "$out" "$VICTIM"
+}
+
+test_commondir_file_cannot_mount_another_repo() {
+  make_victim_repo
+  printf '%s\n' "$VICTIM/.git" >"$PROJECT/.git/commondir"
+  assert_no_victim_mount
+}
+
+test_crafted_git_file_cannot_mount_another_repo() {
+  make_victim_repo
+  rm -rf "$PROJECT/.git"
+  mkdir -p "$PROJECT/.fake"
+  echo 'ref: refs/heads/main' >"$PROJECT/.fake/HEAD"
+  printf '%s\n' "$VICTIM/.git" >"$PROJECT/.fake/commondir"
+  echo 'gitdir: ./.fake' >"$PROJECT/.git"
+  assert_no_victim_mount
+}
+
+test_git_file_into_another_repos_worktree_is_not_mounted() {
+  make_victim_repo
+  git -C "$VICTIM" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+  git -C "$VICTIM" worktree add -q "$SANDBOX/victim-wt"
+  rm -rf "$PROJECT/.git"
+  echo "gitdir: $VICTIM/.git/worktrees/victim-wt" >"$PROJECT/.git"
+  assert_no_victim_mount
+}
+
 test_double_dash_passes_the_rest_to_claude() {
   assert_contains "$(carrel --dry-run rust -- --help 2>/dev/null)" "carrel:rust claude --help"
 }
@@ -486,6 +542,12 @@ run_test "help works without jq"             test_help_works_without_jq
 run_test "help lists every variant"          test_help_lists_every_variant
 run_test "every variant recognised"          test_every_variant_is_recognised
 run_test "show-origin warns once"            test_show_origin_warns_once
+run_test "worktree mounts main .git"         test_worktree_mounts_main_git_dir
+run_test "relative worktree mounts .git"     test_relative_worktree_mounts_main_git_dir
+run_test "main checkout mounts no .git"      test_main_checkout_mounts_no_extra_git_dir
+run_test "commondir can't mount a repo"      test_commondir_file_cannot_mount_another_repo
+run_test "crafted .git can't mount a repo"   test_crafted_git_file_cannot_mount_another_repo
+run_test ".git into other worktree no mount" test_git_file_into_another_repos_worktree_is_not_mounted
 run_test "-- passes the rest to claude"      test_double_dash_passes_the_rest_to_claude
 run_test "sync --dry-run writes nothing"     test_sync_dry_run_writes_nothing
 run_test "sync stays inside ~/.claude"       test_sync_refuses_paths_outside_claude_dir

@@ -909,6 +909,36 @@ clipboard_args() {
   printf '%s\n' -v "$sock:$CLIPBOARD_SOCKET:rw" -e "WAYLAND_DISPLAY=$CLIPBOARD_SOCKET"
 }
 
+# Docker args mounting the main checkout's .git dir when running in a linked
+# worktree, printed one per line (empty otherwise). A worktree's .git is only a
+# file pointing into that dir, which holds the objects, refs and the worktree's
+# own index, so git can't work without it. Read-write so commits work, the same
+# access the project's own .git gets.
+worktree_args() {
+  local git_dir common_dir top back_link
+  git_dir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 0
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [ "$git_dir" != "$common_dir" ] || return 0
+
+  # Both paths are steered by files inside the project (.git, .git/commondir),
+  # which the agent can write, so on their own they could name any repo on the
+  # host. Only trust the layout `git worktree add` creates: this worktree's dir
+  # sits directly under <common>/worktrees/, and the gitdir file in it, which
+  # lives outside the project, points back at this worktree's .git.
+  git_dir="$(realpath -e "$git_dir" 2>/dev/null)" || return 0
+  common_dir="$(realpath -e "$common_dir" 2>/dev/null)" || return 0
+  [ "$(dirname "$git_dir")" = "$common_dir/worktrees" ] || return 0
+  back_link="$(head -n 1 "$git_dir/gitdir" 2>/dev/null)" || return 0
+  [[ "$back_link" == /* ]] || back_link="$git_dir/$back_link"
+  [ "$(realpath -m "$back_link")" = "$(realpath -m "$top/.git")" ] || return 0
+
+  case "$common_dir/" in
+    "$PWD"/*) return 0 ;;
+  esac
+  printf '%s\n' -v "$common_dir:$common_dir:rw"
+}
+
 # Claude keys session history by the project path, with slashes turned to dashes.
 session_dir() {
   local p="${1:-$PWD}"
@@ -1072,6 +1102,9 @@ tz="$(host_timezone)"
 clip_args=()
 while IFS= read -r arg; do clip_args+=("$arg"); done < <(clipboard_args)
 
+worktree_mount_args=()
+while IFS= read -r arg; do worktree_mount_args+=("$arg"); done < <(worktree_args)
+
 run=(
   docker run --rm -it -w "$PWD"
   ${tz_args[@]+"${tz_args[@]}"}
@@ -1086,6 +1119,7 @@ run=(
   -v "${IMAGE_NAME}-opencode-cache":/home/claude/.cache/opencode
   -v "${IMAGE_NAME}-node":/home/claude/.nvm/versions/node
   -v "$PWD":"$PWD"
+  ${worktree_mount_args[@]+"${worktree_mount_args[@]}"}
   ${mount_args[@]+"${mount_args[@]}"}
   "${IMAGE_NAME}:${tag}"
 )

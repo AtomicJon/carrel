@@ -78,6 +78,8 @@ and modify a project without touching your host environment. Each run is
 - `~/.carrel/claude` → `~/.claude` — carrel's own config + session history
 - `~/.carrel/claude.json` → `~/.claude.json` — carrel's onboarding/config state
 - the project directory → mounted at its real host path
+- in a git worktree, the main checkout's `.git` directory → mounted at its real
+  host path (read-write), since the worktree's history lives there
 - a named `carrel-claude` volume → the Claude binary (`~/.local/share/claude`)
 - a named `carrel-node` volume → cached Node versions
 - for [opencode](#opencode): `~/.carrel/opencode/{config,data,state}` → its
@@ -85,6 +87,12 @@ and modify a project without touching your host environment. Each run is
   `carrel-opencode` (binary) and `carrel-opencode-cache` volumes
 - anything you opt into via [extra mounts](#extra-mounts) (ssh key, caches, …)
   or the [clipboard](#clipboard--image-paste) flag
+
+> **Worktrees.** Inside the container, git can see your other worktrees but not
+> their folders, so it treats them as deleted. Avoid `git worktree prune` in
+> there: it removes their records (including anything staged in them). `git gc`
+> can prune too, but only worktrees missing for longer than
+> `gc.worktreePruneExpire` (3 months by default).
 
 Goals:
 
