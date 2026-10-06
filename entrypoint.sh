@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Bootstrap Claude + a project's Node toolchain at container start.
+# Bootstrap Claude / opencode + a project's Node toolchain at container start.
 #
-# Neither Claude nor Node is baked into the image, keeping it small. Both are
-# installed on demand into named volumes, so it's a one-time download that
-# persists across runs — and Claude self-updates.
+# Neither Claude, opencode nor Node is baked into the image, keeping it small.
+# Each is installed on demand into a named volume, so it's a one-time download
+# that persists across runs — and both agents self-update. An agent is only
+# installed when it's the command being run (or a shell, which may want either).
 #
 # Claude: the versioned binaries live in a volume at ~/.local/share/claude. The
 #   launcher symlink (~/.local/bin/claude) is NOT in the volume, so we recreate
@@ -28,12 +29,19 @@ claude_versions=/home/claude/.local/share/claude/versions
 claude_latest() { ls -1 "$claude_versions" 2>/dev/null | sort -V | tail -1; }
 
 ver="$(claude_latest)"
-if [ -z "$ver" ]; then
+if [ -z "$ver" ] && [[ "${1:-}" == claude || "${1:-}" == bash ]]; then
     echo "carrel: installing Claude Code (first run)..." >&2
     curl -fsSL https://claude.ai/install.sh | bash >/dev/null
     ver="$(claude_latest)"
 fi
 [ -n "$ver" ] && ln -sfn "$claude_versions/$ver" /home/claude/.local/bin/claude
+
+# opencode — installed into ~/.opencode/bin (a volume, already on PATH). It
+# upgrades itself in place via its autoupdate, which the volume makes stick.
+if [ ! -x /home/claude/.opencode/bin/opencode ] && [[ "${1:-}" == opencode || "${1:-}" == bash ]]; then
+    echo "carrel: installing opencode (first run)..." >&2
+    curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path >/dev/null
+fi
 
 if [ -f package.json ] || [ -f .nvmrc ] || [ -f .node-version ]; then
     echo "carrel: provisioning Node for this project..." >&2

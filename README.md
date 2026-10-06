@@ -26,6 +26,7 @@ same in bash, zsh, or fish. Just make sure `~/.local/bin` is on your `PATH`.
 ```
 carrel [variant] [claude args...]    run Claude (variant: base|rust|tauri)
 carrel shell [variant]               open a shell instead of Claude
+carrel opencode [variant] [args...]  run opencode instead of Claude
 carrel config get|set …              read and write settings
 carrel trust                         review and trust this repo's .carrel.json
 carrel sessions                      print this project's session directory
@@ -79,6 +80,9 @@ and modify a project without touching your host environment. Each run is
 - the project directory → mounted at its real host path
 - a named `carrel-claude` volume → the Claude binary (`~/.local/share/claude`)
 - a named `carrel-node` volume → cached Node versions
+- for [opencode](#opencode): `~/.carrel/opencode/{config,data,state}` → its
+  `~/.config`, `~/.local/share` and `~/.local/state` dirs, plus the
+  `carrel-opencode` (binary) and `carrel-opencode-cache` volumes
 - anything you opt into via [extra mounts](#extra-mounts) (ssh key, caches, …)
   or the [clipboard](#clipboard--image-paste) flag
 
@@ -119,6 +123,19 @@ Claude is bootstrapped the same way: the entrypoint installs it into the
 auto-updater to keep it current.
 
 > Switch versions inside a running container with `nvm install <version>`.
+
+### opencode
+
+`carrel opencode [variant] [args...]` runs [opencode](https://opencode.ai)
+instead of Claude, in the same image and with the same mounts. It's installed
+into the `carrel-opencode` volume on first launch (Claude isn't installed unless
+you run it), and upgrades itself in place via opencode's built-in autoupdate,
+which the volume makes stick. `carrel shell` installs both.
+
+opencode has its own login, saved in `~/.carrel/opencode/data`, and its sessions
+live there too. No opencode config is synced from the host, but opencode falls
+back to `~/.claude/CLAUDE.md` and `~/.claude/skills`, so the synced Claude
+config carries over.
 
 ## Configuration & sessions
 

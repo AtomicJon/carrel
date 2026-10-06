@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# carrel — run an isolated, containerised Claude Code in the current project.
+# carrel — run an isolated, containerised Claude Code (or opencode) in the
+# current project.
 #
 # carrel keeps its own config dir (CARREL_HOME, default ~/.carrel), separate from
 # your real ~/.claude. Selected config files are synced in on each launch;
@@ -51,6 +52,7 @@ carrel — run an isolated, containerised Claude Code in the current project.
 Usage:
   carrel [variant] [claude args...]   run Claude   (variant: ${variants// /|})
   carrel shell [variant]              open a shell instead of Claude
+  carrel opencode [variant] [args...] run opencode instead of Claude
   carrel config <cmd>                 read/write settings (see below)
   carrel trust                        review and trust this repo's .carrel.json
   carrel sync                         sync host config into carrel's dir
@@ -764,6 +766,14 @@ sync_settings() {
   fi
 }
 
+# opencode's dirs, created up front so Docker doesn't create them root-owned.
+# Nothing is synced: opencode already falls back to ~/.claude/CLAUDE.md and
+# ~/.claude/skills, which the sync above covers.
+sync_opencode() {
+  mkdir -p "$CARREL_HOME/opencode/config" "$CARREL_HOME/opencode/data" \
+    "$CARREL_HOME/opencode/state"
+}
+
 # One-way host -> carrel config sync, over the items the `sync` key names.
 # Symlinks (e.g. dotfiles) are dereferenced so the container sees real files, not
 # dangling links. Only changed files are copied, and each one is printed.
@@ -805,6 +815,7 @@ do_sync() {
   done < <(config_get sync)
 
   sync_settings
+  sync_opencode
 }
 
 # Parse one mount spec (HOST[:CONTAINER][:ro|:rw]) into a normalised
@@ -1055,6 +1066,10 @@ case "${1:-}" in
     launch=shell
     shift
     ;;
+  opencode)
+    launch=opencode
+    shift
+    ;;
 esac
 
 tag=""
@@ -1103,7 +1118,12 @@ run=(
   ${clip_args[@]+"${clip_args[@]}"}
   -v "$CARREL_HOME/claude":/home/claude/.claude
   -v "$CARREL_HOME/claude.json":/home/claude/.claude.json
+  -v "$CARREL_HOME/opencode/config":/home/claude/.config/opencode
+  -v "$CARREL_HOME/opencode/data":/home/claude/.local/share/opencode
+  -v "$CARREL_HOME/opencode/state":/home/claude/.local/state/opencode
   -v "${IMAGE_NAME}-claude":/home/claude/.local/share/claude
+  -v "${IMAGE_NAME}-opencode":/home/claude/.opencode
+  -v "${IMAGE_NAME}-opencode-cache":/home/claude/.cache/opencode
   -v "${IMAGE_NAME}-node":/home/claude/.nvm/versions/node
   -v "$PWD":"$PWD"
   ${mount_args[@]+"${mount_args[@]}"}
@@ -1112,6 +1132,8 @@ run=(
 
 if [ "$launch" = shell ]; then
   run+=(bash)
+elif [ "$launch" = opencode ]; then
+  run+=(opencode "$@" ${passthrough[@]+"${passthrough[@]}"})
 else
   run+=(claude "$@" ${passthrough[@]+"${passthrough[@]}"})
 fi

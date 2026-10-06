@@ -319,6 +319,13 @@ test_shell_launches_bash() {
   assert_contains "$(carrel shell --dry-run rust 2>/dev/null)" "carrel:rust bash"
 }
 
+test_opencode_launches_opencode() {
+  local out
+  out="$(carrel opencode --dry-run rust --continue 2>/dev/null)"
+  assert_contains "$out" "carrel:rust opencode --continue"
+  assert_contains "$out" "$CARREL_HOME/opencode/data:/home/claude/.local/share/opencode"
+}
+
 # The Makefile passes --image ahead of the subcommand, so flags have to be
 # recognised on either side of it.
 test_flags_may_precede_a_subcommand() {
@@ -485,6 +492,7 @@ run_test "tz from config and flag"           test_tz_falls_back_to_the_host
 run_test "migrates legacy mounts file"       test_migrates_legacy_mounts_file
 run_test "claude args pass through"          test_claude_args_still_pass_through
 run_test "shell launches bash"               test_shell_launches_bash
+run_test "opencode launches opencode"        test_opencode_launches_opencode
 run_test "flags may precede a subcommand"    test_flags_may_precede_a_subcommand
 run_test "config flags reach config"         test_config_flags_are_not_eaten_by_the_launcher
 run_test "untrusted repo config skipped"     test_untrusted_repo_config_is_skipped

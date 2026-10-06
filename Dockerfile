@@ -3,10 +3,10 @@
 # Multi-target image for running Claude Code in a sandboxed dev container.
 #
 #   base   debian-slim + code search/nav tools + gh/glab CLIs + nvm.
-#          Neither Claude nor Node is baked in; the entrypoint installs Claude
-#          on first launch and provisions the project's Node version on demand,
-#          both cached in volumes, so the image stays small and Claude
-#          self-updates. corepack is enabled per-project, so this also covers
+#          Neither Claude, opencode nor Node is baked in; the entrypoint
+#          installs Claude or opencode on first launch and provisions the
+#          project's Node version on demand, all cached in volumes, so the
+#          image stays small and both agents self-update. corepack is enabled per-project, so this also covers
 #          JS/TS work.
 #   rust   base + rustup toolchain (clippy, rustfmt)
 #   tauri  rust + web build deps (webkit, gtk) + tauri-cli
@@ -101,6 +101,9 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 claude \
     && mkdir -p /workspace /home/claude/.claude \
         /home/claude/.local/bin /home/claude/.local/share/claude \
         /home/claude/.local/share/pnpm /home/claude/.cache/yarn \
+        /home/claude/.opencode /home/claude/.config/opencode \
+        /home/claude/.local/share/opencode /home/claude/.local/state/opencode \
+        /home/claude/.cache/opencode \
     && chown -R claude:claude /workspace /home/claude
 
 USER claude
@@ -109,7 +112,8 @@ WORKDIR /home/claude
 ENV NVM_DIR=/home/claude/.nvm
 # Claude's binaries live in ~/.local/share/claude (a persistent volume at
 # runtime); ~/.local/bin holds its launcher symlink, which is on PATH.
-ENV PATH=/home/claude/.local/bin:$PATH
+# opencode's binary lives in ~/.opencode/bin, also a persistent volume.
+ENV PATH=/home/claude/.local/bin:/home/claude/.opencode/bin:$PATH
 
 SHELL ["/bin/bash", "-c"]
 
@@ -121,9 +125,9 @@ RUN curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/${NVM_VERSION}/inst
     # (the default alias). Silent + no-op when the project isn't a Node project.
     && echo 'nvm use default --silent >/dev/null 2>&1 || true' >> /home/claude/.bashrc
 
-# Claude itself is NOT installed here. The entrypoint installs it into
-# ~/.local/share/claude (a named volume) on first launch, so it's shared across
-# variants and self-updates between runs.
+# Claude and opencode are NOT installed here. The entrypoint installs them into
+# ~/.local/share/claude and ~/.opencode (named volumes) on first launch, so
+# they're shared across variants and self-update between runs.
 
 WORKDIR /workspace
 ENTRYPOINT ["carrel-entrypoint"]
