@@ -86,7 +86,8 @@ and modify a project without touching your host environment. Each run is
   `~/.config`, `~/.local/share` and `~/.local/state` dirs, plus the
   `carrel-opencode` (binary) and `carrel-opencode-cache` volumes
 - anything you opt into via [extra mounts](#extra-mounts) (ssh key, caches, …)
-  or the [clipboard](#clipboard--image-paste) flag
+  or the [clipboard](#clipboard--image-paste) and [ssh agent](#ssh-agent--git-over-ssh)
+  flags
 
 > **Worktrees.** Inside the container, git can see your other worktrees but not
 > their folders, so it treats them as deleted. Avoid `git worktree prune` in
@@ -149,7 +150,7 @@ config carries over.
 
 ### Settings
 
-Everything carrel does is driven by six keys, read from JSON config files and
+Everything carrel does is driven by seven keys, read from JSON config files and
 managed with `carrel config`:
 
 | Key         | Type   | Default        | What it does                            |
@@ -158,6 +159,7 @@ managed with `carrel config`:
 | `image`     | string | `carrel`       | image name / tag prefix                 |
 | `tz`        | string | the host's     | container timezone                      |
 | `clipboard` | bool   | `false`        | forward the host's Wayland clipboard    |
+| `ssh_agent` | string | `off`          | forward an ssh-agent: `host`/`carrel`   |
 | `mounts`    | list   | `[]`           | extra host items to pass in             |
 | `sync`      | list   | see below      | what's mirrored from your `~/.claude`   |
 
@@ -169,7 +171,7 @@ carrel config get --show-origin         # …and which file each came from
 carrel config set variant rust          # global default
 carrel config set --project variant rust   # …for this project only
 carrel config set --repo variant rust      # …in the repo's shared .carrel.json
-carrel config add mounts ~/.ssh:/home/claude/.ssh   # append to a list
+carrel config add mounts ~/.gitconfig:/home/claude/.gitconfig   # append to a list
 carrel config unset --project variant
 carrel config path --project            # the file set/add would write
 ```
@@ -180,6 +182,7 @@ Every setting also has a flag that overrides it for a single run:
 carrel --image carrel-fork rust         # image
 carrel --tz UTC                         # tz
 carrel --clipboard                      # clipboard on (--no-clipboard for off)
+carrel --ssh-agent carrel               # ssh agent on (--no-ssh-agent for off)
 carrel -m ~/.aws:/home/claude/.aws      # add a mount (repeatable)
 carrel --dry-run                        # print the docker command, don't run it
 ```
@@ -212,7 +215,7 @@ it, so it's never visible to the agent.
 $ carrel config get --show-origin
   clipboard  true                                 /home/you/.carrel/projects/-home-you-api.json
   image      carrel                               (default)
-  mounts     ~/.ssh:/home/claude/.ssh             /home/you/.carrel/config.json
+  mounts     ~/.gitconfig:/home/claude/.gitconfig /home/you/.carrel/config.json
   mounts     carrel-pnpm:/home/claude/…:rw        /home/you/api/.carrel.json
   variant    rust                                 /home/you/api/.carrel.json
 ```
@@ -258,6 +261,8 @@ project's own:
 | `mounts` — anything else       | **skipped**, with a warning                     |
 | `clipboard: false`             | honoured                                        |
 | `clipboard: true`              | **ignored**, with a warning                     |
+| `ssh_agent: "off"`             | honoured                                        |
+| `ssh_agent: "host"`/`"carrel"` | **ignored**, with a warning                     |
 | `sync`                         | **ignored**, with a warning                     |
 
 `~` and `$VAR` are refused outright, and both sides of the "inside the project"
@@ -266,9 +271,9 @@ it. Everything a repo can't grant, you can — the warning tells you how:
 
 ```
 $ carrel
-carrel: skipping mount '~/.ssh:/home/claude/.ssh' in /home/you/api/.carrel.json
+carrel: skipping mount '~/.aws:/home/claude/.aws' in /home/you/api/.carrel.json
         (outside the project); add it with
-        'carrel config add --project mounts ~/.ssh:/home/claude/.ssh'
+        'carrel config add --project mounts ~/.aws:/home/claude/.aws'
 ```
 
 To write a repo config, edit `.carrel.json` directly or use `--repo`, which
@@ -301,12 +306,12 @@ and a fixtures directory from the repo:
 ### Extra mounts
 
 By default only the project directory crosses into the container. Some work
-needs a few host-side items from *outside* the project — an SSH key to
-`git push`, your `~/.gitconfig`, or a warm package-manager cache. That's the
+needs a few host-side items from *outside* the project - your SSH
+`known_hosts`, your `~/.gitconfig`, or a warm package-manager cache. That's the
 `mounts` key:
 
 ```bash
-carrel config add mounts ~/.ssh:/home/claude/.ssh              # everywhere
+carrel config add mounts ~/.gitconfig:/home/claude/.gitconfig  # everywhere
 carrel config add --project mounts ~/.aws:/home/claude/.aws    # this project
 carrel -m ~/.aws:/home/claude/.aws rust                        # just this run
 ```
@@ -323,15 +328,15 @@ Each spec is `HOST[:CONTAINER][:ro|:rw]`:
 - `:ro` / `:rw` — access mode, **read-only by default**. An autonomous agent runs
   in the container, so writes are opt-in per mount.
 
-Good candidates for `~/.carrel/config.json`: `~/.ssh` for git over SSH,
-`~/.gitconfig` for your name and aliases, `~/.config/gh` and
-`~/.config/glab-cli` for `gh`/`glab` logins, and named volumes for persistent
-pnpm and yarn caches:
+Good candidates for `~/.carrel/config.json`: `~/.ssh/known_hosts` for git over
+SSH (see [ssh agent](#ssh-agent--git-over-ssh) for the key), `~/.gitconfig` for
+your name and aliases, `~/.config/gh` and `~/.config/glab-cli` for `gh`/`glab`
+logins, and named volumes for persistent pnpm and yarn caches:
 
 ```json
 {
   "mounts": [
-    "~/.ssh:/home/claude/.ssh",
+    "~/.ssh/known_hosts:/etc/ssh/ssh_known_hosts",
     "~/.gitconfig:/home/claude/.gitconfig",
     "~/.config/gh:/home/claude/.config/gh",
     "~/.config/glab-cli:/home/claude/.config/glab-cli",
@@ -398,8 +403,10 @@ container.
 
 `--delete` is applied **per synced directory**, so removing a file from
 `~/.claude/agents/` removes it from carrel too — but it never touches anything
-outside the list. Credentials and session history are never synced: the
-container logs in on its own and keeps its sessions to itself.
+outside the list. The one exception inside the list is `skills/synced`, where
+Claude Code in the container downloads your claude.ai account skills: it's
+neither copied from the host nor deleted. Credentials and session history are
+never synced: the container logs in on its own and keeps its sessions to itself.
 
 ```bash
 carrel config set sync CLAUDE.md skills agents   # narrow it
@@ -463,6 +470,99 @@ copy an image, it'll work in the container too.
 `wl-clipboard` ships in the base image, so `--clipboard` needs no rebuild beyond
 picking up a current image. The socket is the *only* thing forwarded — no
 `XDG_RUNTIME_DIR`, no other host runtime state.
+
+### SSH agent & git over SSH
+
+Pushing over SSH needs two things: a key to sign in with, and a list of
+trusted server keys so ssh can tell it's talking to the real server.
+
+**The key: forward an ssh-agent.** Don't mount `~/.ssh`: that hands the agent
+your private keys to read or copy. The `ssh_agent` setting binds an ssh-agent
+socket into the container instead, so the key stays on the host and the
+container can only ask the agent to sign. While the container runs, it can use
+*every* key that agent holds, against *any* server it can reach, so pick which
+agent it gets:
+
+| Mode     | Agent forwarded                  | Keys the container can use       |
+| -------- | -------------------------------- | -------------------------------- |
+| `off`    | none (the default)               | none                             |
+| `host`   | yours (`SSH_AUTH_SOCK`)          | every key you've loaded          |
+| `carrel` | one carrel runs for this session | only the keys in `~/.carrel/ssh` |
+
+```bash
+carrel --ssh-agent carrel                     # this run only
+carrel config set --project ssh_agent host    # standing, for this project
+carrel config set ssh_agent carrel            # standing, everywhere
+carrel --no-ssh-agent                         # opt back out for one run
+```
+
+A repo's `.carrel.json` can turn it off but never on.
+
+**`carrel` mode** keeps the agent's git access separate from yours. Give it its
+own key, then register the public key with only the access you want it to
+have, e.g. as a deploy key with write access on specific repos (GitLab lets one
+deploy key cover several projects; GitHub needs one per repo):
+
+```bash
+ssh-keygen -t ed25519 -C carrel -f ~/.carrel/ssh/id_ed25519
+cat ~/.carrel/ssh/id_ed25519.pub              # add this to GitLab / GitHub
+```
+
+Each launch starts a fresh agent and loads every `id_*` private key in
+`~/.carrel/ssh` into it, asking for any passphrase on the terminal. If a key
+won't load, carrel stops rather than launching without it. The agent runs the
+session itself and exits shortly after it ends, even if carrel is killed, so
+nothing a session does to its agent (such as locking it or swapping keys)
+carries over to the next one. The agent also refuses to load PKCS#11 libraries
+(`ssh-agent -P none`), so the container can't make it load code on the host.
+
+The key file stays out of the container's reach: carrel doesn't mount
+`~/.carrel/ssh`, and if the project or one of your extra mounts contains it
+(such as running carrel from your home folder), carrel mounts an empty folder
+over it. Mounting anything from inside `~/.carrel/ssh` is refused. Pushes
+signed with the key are easy to spot, and you can revoke it without touching
+your own key.
+
+**`host` mode** is the quick option: it reuses whatever your own agent holds.
+It's also your real agent, so anything the container does to it (removing,
+adding or locking keys) stays after the session ends.
+To narrow it, limit where each key works when you load it (OpenSSH 8.9+):
+
+```bash
+ssh-add -h github.com -h gitlab.com ~/.ssh/id_ed25519
+```
+
+A key loaded this way only signs in to the listed hosts, from the container or
+anywhere else. carrel doesn't control how your own agent was started: unless it
+was started with `ssh-agent -P none`, the container can ask it to load PKCS#11
+libraries from the host's `/usr/lib`. Use `carrel` mode if that matters to you.
+
+**Server keys: share your host's `known_hosts`, read-only.** Mount it as the
+container's system-wide known-hosts file:
+
+```bash
+carrel config add mounts ~/.ssh/known_hosts:/etc/ssh/ssh_known_hosts
+```
+
+Servers you've already trusted on the host are trusted in the container, and
+the agent can't add or change entries. An unknown server fails rather than
+being trusted on first sight: connect to it once on the host
+(`ssh -T git@newhost`) and it works in carrel from then on.
+
+Requirements:
+
+- **Linux:** `host` mode needs a running ssh-agent with `SSH_AUTH_SOCK` set;
+  `carrel` mode needs `ssh-agent` installed. If the agent can't be reached,
+  carrel warns and launches without it.
+- **Your host user is uid 1000.** ssh-agent only answers processes running as
+  its own user, and the container runs as uid 1000. Rootless Docker, Podman and
+  `userns-remap` map that uid to a different host user, so the agent refuses
+  the container.
+- **Docker runs natively.** Docker Desktop on Linux runs containers in a VM that
+  can't reach sockets on the host, so neither mode works there.
+- **macOS:** `host` mode uses Docker Desktop's forwarded agent at
+  `/run/host-services/ssh-auth.sock`. `carrel` mode isn't supported, as Docker
+  Desktop can only forward your own agent.
 
 ### Timezone
 

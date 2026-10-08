@@ -204,6 +204,312 @@ test_repo_may_disable_clipboard() {
   assert_equals "$(carrel config get clipboard 2>/dev/null)" "false"
 }
 
+test_repo_cannot_enable_ssh_agent() {
+  local mode err
+  for mode in host carrel; do
+    write_repo_config "{\"ssh_agent\": \"$mode\"}"
+
+    err="$(carrel config get ssh_agent 2>&1)"
+
+    assert_contains "$err" "only you can turn it on"
+    assert_contains "$err" "off"
+  done
+}
+
+test_repo_may_disable_ssh_agent() {
+  write_config "$CARREL_HOME/config.json" '{"ssh_agent": "host"}'
+  write_repo_config '{"ssh_agent": "off"}'
+
+  local mode
+  mode="$(carrel config get ssh_agent 2>/dev/null)"
+
+  assert_equals "$mode" "off"
+}
+
+# A unix socket standing in for an ssh-agent, for dry runs.
+make_fake_agent_socket() {
+  python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
+}
+
+test_ssh_agent_is_off_by_default() {
+  local sock="$SANDBOX/agent.sock"
+  make_fake_agent_socket "$sock"
+
+  local out
+  out="$(SSH_AUTH_SOCK="$sock" carrel --dry-run 2>/dev/null)"
+
+  assert_not_contains "$out" "SSH_AUTH_SOCK"
+}
+
+test_ssh_agent_host_forwards_your_socket() {
+  local sock="$SANDBOX/agent.sock"
+  make_fake_agent_socket "$sock"
+
+  local out
+  out="$(SSH_AUTH_SOCK="$sock" carrel --ssh-agent host --dry-run 2>/dev/null)"
+
+  assert_contains "$out" "$sock:/run/carrel/ssh-agent.sock:rw"
+  assert_contains "$out" "SSH_AUTH_SOCK=/run/carrel/ssh-agent.sock"
+}
+
+test_no_ssh_agent_flag_beats_config() {
+  local sock="$SANDBOX/agent.sock"
+  make_fake_agent_socket "$sock"
+  write_config "$CARREL_HOME/config.json" '{"ssh_agent": "host"}'
+
+  local out
+  out="$(SSH_AUTH_SOCK="$sock" carrel --no-ssh-agent --dry-run 2>/dev/null)"
+
+  assert_not_contains "$out" "SSH_AUTH_SOCK"
+}
+
+test_ssh_agent_carrel_forwards_a_session_socket() {
+  mkdir -p "$CARREL_HOME/ssh"
+  touch "$CARREL_HOME/ssh/id_ed25519"
+
+  local out
+  out="$(SSH_AUTH_SOCK="$SANDBOX/host.sock" carrel --ssh-agent=carrel --dry-run 2>/dev/null)"
+
+  assert_contains "$out" "carrel-ssh.XXXXXX/agent.sock:/run/carrel/ssh-agent.sock:rw"
+  assert_not_contains "$out" "host.sock"
+}
+
+test_ssh_agent_carrel_without_keys_warns_and_launches() {
+  local out err
+  out="$(carrel --ssh-agent carrel --dry-run 2>"$SANDBOX/err")"
+  err="$(cat "$SANDBOX/err")"
+
+  assert_contains "$out" "docker run"
+  assert_not_contains "$out" "SSH_AUTH_SOCK"
+  assert_contains "$err" "ssh-keygen"
+}
+
+# Puts a fake docker first on PATH that logs the keys the forwarded agent holds
+# and the agent socket it was given, so a real launch can be inspected.
+stub_docker() {
+  mkdir -p "$SANDBOX/bin"
+  cat >"$SANDBOX/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "docker sees SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-} SSH_AGENT_PID=${SSH_AGENT_PID:-}"
+for arg in "$@"; do
+  case "$arg" in
+    *:/run/carrel/ssh-agent.sock:rw)
+      sock="${arg%%:*}"
+      echo "socket $sock"
+      SSH_AUTH_SOCK="$sock" ssh-add -l
+      ;;
+  esac
+done
+STUB
+  chmod +x "$SANDBOX/bin/docker"
+}
+
+# Waits up to 15 seconds for the agent behind a socket to stop answering;
+# ssh-agent checks on the command it runs every 10.
+agent_has_stopped() {
+  local attempt
+  for attempt in $(seq 15); do
+    if ! SSH_AUTH_SOCK="$1" ssh-add -l >/dev/null 2>&1 && [ ! -e "$1" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+test_ssh_agent_carrel_runs_an_agent_for_the_session() {
+  stub_docker
+  mkdir -p "$CARREL_HOME/ssh"
+  ssh-keygen -q -t ed25519 -N '' -C carrel-test -f "$CARREL_HOME/ssh/id_ed25519"
+
+  local out sock stopped=no
+  out="$(XDG_RUNTIME_DIR="$SANDBOX" PATH="$SANDBOX/bin:$PATH" carrel --ssh-agent carrel 2>/dev/null)"
+  sock="$(printf '%s\n' "$out" | sed -n 's/^socket //p')"
+  if agent_has_stopped "$sock"; then
+    stopped=yes
+  fi
+
+  assert_contains "$out" "carrel-test (ED25519)"
+  assert_contains "$sock" "$SANDBOX/carrel-ssh."
+  assert_equals "$stopped" "yes"
+}
+
+test_ssh_agent_carrel_leaves_docker_your_own_agent() {
+  stub_docker
+  mkdir -p "$CARREL_HOME/ssh"
+  ssh-keygen -q -t ed25519 -N '' -C carrel-test -f "$CARREL_HOME/ssh/id_ed25519"
+
+  local out
+  out="$(SSH_AUTH_SOCK=/host/agent.sock XDG_RUNTIME_DIR="$SANDBOX" PATH="$SANDBOX/bin:$PATH" \
+    carrel --ssh-agent carrel 2>/dev/null)"
+
+  assert_contains "$out" "docker sees SSH_AUTH_SOCK=/host/agent.sock SSH_AGENT_PID="$'\n'
+}
+
+test_ssh_agent_carrel_refuses_pkcs11_providers() {
+  stub_docker
+  mkdir -p "$CARREL_HOME/ssh"
+  touch "$CARREL_HOME/ssh/id_ed25519"
+  printf '#!/bin/sh\necho "ssh-agent $*" >"%s/ssh-agent.log"\n' "$SANDBOX" >"$SANDBOX/bin/ssh-agent"
+  chmod +x "$SANDBOX/bin/ssh-agent"
+
+  XDG_RUNTIME_DIR="$SANDBOX" PATH="$SANDBOX/bin:$PATH" carrel --ssh-agent carrel >/dev/null 2>&1
+
+  assert_contains "$(cat "$SANDBOX/ssh-agent.log")" "ssh-agent -P none -a "
+}
+
+test_ssh_agent_carrel_keeps_fresh_dirs_and_prunes_old_empty_ones() {
+  stub_docker
+  mkdir -p "$CARREL_HOME/ssh" "$SANDBOX/carrel-ssh.starting" "$SANDBOX/carrel-ssh.finished"
+  ssh-keygen -q -t ed25519 -N '' -C carrel-test -f "$CARREL_HOME/ssh/id_ed25519"
+  touch -d '2 minutes ago' "$SANDBOX/carrel-ssh.finished"
+
+  XDG_RUNTIME_DIR="$SANDBOX" PATH="$SANDBOX/bin:$PATH" carrel --ssh-agent carrel >/dev/null 2>&1
+
+  [ -d "$SANDBOX/carrel-ssh.starting" ] || fail "expected a fresh session dir to be kept"
+  [ -d "$SANDBOX/carrel-ssh.finished" ] && fail "expected an old empty session dir to be removed"
+}
+
+test_ssh_agent_carrel_stops_when_keys_fail_to_load() {
+  stub_docker
+  mkdir -p "$CARREL_HOME/ssh"
+  ssh-keygen -q -t ed25519 -N 'secret' -C carrel-test -f "$CARREL_HOME/ssh/id_ed25519"
+
+  local out status=0
+  out="$(SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=force XDG_RUNTIME_DIR="$SANDBOX" \
+    PATH="$SANDBOX/bin:$PATH" carrel --ssh-agent carrel 2>&1)" || status=$?
+
+  assert_equals "$status" "1"
+  assert_contains "$out" "not launching"
+  assert_not_contains "$out" "socket "
+}
+test_ssh_key_dir_is_hidden_from_a_project_containing_it() {
+  export CARREL_HOME="$PROJECT/.carrel"
+  mkdir -p "$CARREL_HOME/ssh"
+
+  local out
+  out="$(carrel --dry-run 2>/dev/null)"
+
+  assert_contains "$out" "--mount type=tmpfs\\,destination=$PROJECT/.carrel/ssh"
+}
+
+test_ssh_key_dir_is_hidden_at_the_project_path_given() {
+  mkdir -p "$SANDBOX/real"
+  mv "$PROJECT" "$SANDBOX/real/project"
+  ln -s "$SANDBOX/real" "$SANDBOX/link"
+  export CARREL_HOME="$SANDBOX/link/project/.carrel"
+  mkdir -p "$CARREL_HOME/ssh"
+  cd "$SANDBOX/link/project" || return
+
+  local out
+  out="$(carrel --dry-run 2>/dev/null)"
+
+  assert_contains "$out" "destination=$SANDBOX/link/project/.carrel/ssh"
+  assert_not_contains "$out" "destination=$SANDBOX/real"
+}
+
+test_ssh_key_dir_is_hidden_inside_extra_mounts() {
+  mkdir -p "$CARREL_HOME/ssh"
+
+  local out
+  out="$(carrel -m "$SANDBOX:/data" --dry-run 2>/dev/null)"
+
+  assert_contains "$out" "destination=/data/home/ssh"
+}
+
+test_ssh_key_dir_is_hidden_inside_a_root_mount() {
+  mkdir -p "$CARREL_HOME/ssh"
+
+  local out
+  out="$(carrel -m "/:/host" --dry-run 2>/dev/null)"
+
+  assert_contains "$out" "destination=/host$CARREL_HOME/ssh"
+}
+
+test_ssh_key_dir_is_hidden_once_per_path() {
+  export CARREL_HOME="$PROJECT/.carrel"
+  mkdir -p "$CARREL_HOME/ssh"
+
+  local out
+  out="$(carrel -m "$PROJECT" --dry-run 2>/dev/null)"
+
+  assert_equals "$(printf '%s\n' "$out" | grep -o 'type=tmpfs' | wc -l | tr -d ' ')" "1"
+}
+
+test_ssh_key_dir_behind_a_comma_path_refuses_to_launch() {
+  mkdir -p "$CARREL_HOME/ssh"
+
+  local out status=0
+  out="$(carrel -m "$SANDBOX:/a,destination=/elsewhere" --dry-run 2>&1)" || status=$?
+
+  assert_equals "$status" "1"
+  assert_contains "$out" "can't hide"
+}
+
+test_mount_inside_ssh_key_dir_refuses_to_launch() {
+  mkdir -p "$CARREL_HOME/ssh"
+  touch "$CARREL_HOME/ssh/id_ed25519"
+
+  local out status=0
+  out="$(carrel -m "$CARREL_HOME/ssh/id_ed25519:/k" --dry-run 2>&1)" || status=$?
+
+  assert_equals "$status" "1"
+  assert_contains "$out" "inside carrel's ssh key dir"
+}
+
+test_missing_ssh_key_dir_is_not_mounted_over() {
+  export CARREL_HOME="$PROJECT/.carrel"
+  mkdir -p "$CARREL_HOME"
+
+  local out
+  out="$(carrel --dry-run 2>/dev/null)"
+
+  assert_not_contains "$out" "tmpfs"
+}
+test_ssh_agent_rejects_unknown_flag_values() {
+  local value err
+  for value in yes ""; do
+    err="$(carrel --ssh-agent="$value" --dry-run 2>&1)" && fail "expected a nonzero exit for '$value'"
+
+    assert_contains "$err" "off host carrel"
+  done
+}
+
+test_ssh_agent_set_rejects_unknown_values() {
+  local err
+  err="$(carrel config set ssh_agent true 2>&1)" && fail "expected a nonzero exit"
+
+  assert_contains "$err" "off host carrel"
+}
+
+test_ssh_agent_unknown_config_value_warns() {
+  write_config "$CARREL_HOME/config.json" '{"ssh_agent": "yes"}'
+
+  local out err
+  out="$(carrel --dry-run 2>"$SANDBOX/err")"
+  err="$(cat "$SANDBOX/err")"
+
+  assert_contains "$out" "docker run"
+  assert_contains "$err" "unknown ssh_agent 'yes'"
+}
+
+test_ssh_agent_host_without_socket_warns_and_launches() {
+  local out err
+  out="$(SSH_AUTH_SOCK="$SANDBOX/missing.sock" carrel --ssh-agent host --dry-run 2>"$SANDBOX/err")"
+  err="$(cat "$SANDBOX/err")"
+
+  assert_contains "$out" "docker run"
+  assert_not_contains "$out" "SSH_AUTH_SOCK"
+  assert_contains "$err" "continuing without it"
+}
+
+test_ssh_agent_host_without_agent_warns() {
+  local err
+  err="$(env -u SSH_AUTH_SOCK "$CARREL" --ssh-agent host --dry-run 2>&1 >/dev/null </dev/null)"
+
+  assert_contains "$err" "SSH_AUTH_SOCK is unset"
+}
+
 test_repo_cannot_set_sync() {
   write_repo_config '{"sync": ["evil.sh"]}'
   local err
@@ -381,6 +687,9 @@ test_repo_scope_rejects_what_a_repo_cannot_set() {
   err="$(carrel config set --repo clipboard true 2>&1)" && fail "expected a nonzero exit"
   assert_contains "$err" "clipboard"
 
+  err="$(carrel config set --repo ssh_agent carrel 2>&1)" && fail "expected a nonzero exit"
+  assert_contains "$err" "ssh_agent"
+
   err="$(carrel config set --repo sync CLAUDE.md 2>&1)" && fail "expected a nonzero exit"
   assert_contains "$err" "sync"
 
@@ -502,6 +811,23 @@ test_sync_refuses_paths_outside_claude_dir() {
   assert_contains "$err" "skipping sync item '/etc'"
 }
 
+test_sync_leaves_container_downloaded_skills_alone() {
+  local host="$SANDBOX/fakehome/.claude"
+  mkdir -p "$host/skills/mine" "$host/skills/synced/from-host" \
+    "$CARREL_HOME/claude/skills/synced/bucket" "$CARREL_HOME/claude/skills/stale"
+  touch "$host/skills/mine/SKILL.md" "$CARREL_HOME/claude/skills/synced/bucket/SKILL.md"
+  write_config "$CARREL_HOME/config.json" '{"sync": ["skills"]}'
+
+  local out
+  out="$(HOME="$SANDBOX/fakehome" carrel sync 2>&1)"
+
+  assert_not_contains "$out" "deleting synced"
+  [ -f "$CARREL_HOME/claude/skills/synced/bucket/SKILL.md" ] || fail "expected skills/synced to survive the sync"
+  [ -e "$CARREL_HOME/claude/skills/synced/from-host" ] && fail "expected host skills/synced not to be copied"
+  [ -f "$CARREL_HOME/claude/skills/mine/SKILL.md" ] || fail "expected host skills to be synced"
+  [ -e "$CARREL_HOME/claude/skills/stale" ] && fail "expected skills removed on the host to be deleted"
+}
+
 # ─── Runner ───────────────────────────────────────────────────────────────────
 
 run_test "defaults"                          test_defaults
@@ -516,6 +842,31 @@ run_test "repo mounts volumes and own paths" test_repo_may_mount_named_volumes_a
 run_test "repo cannot enable clipboard"      test_repo_cannot_enable_clipboard
 run_test "repo clipboard must be a bool"      test_repo_cannot_enable_clipboard_via_wrong_type
 run_test "repo may disable clipboard"        test_repo_may_disable_clipboard
+run_test "repo cannot enable ssh agent"      test_repo_cannot_enable_ssh_agent
+run_test "repo may disable ssh agent"        test_repo_may_disable_ssh_agent
+run_test "ssh agent off by default"          test_ssh_agent_is_off_by_default
+run_test "ssh agent host forwards yours"     test_ssh_agent_host_forwards_your_socket
+run_test "--no-ssh-agent beats config"       test_no_ssh_agent_flag_beats_config
+run_test "ssh agent carrel session socket"   test_ssh_agent_carrel_forwards_a_session_socket
+run_test "ssh agent carrel needs keys"       test_ssh_agent_carrel_without_keys_warns_and_launches
+run_test "ssh agent carrel per session"      test_ssh_agent_carrel_runs_an_agent_for_the_session
+run_test "ssh agent carrel bad key stops"    test_ssh_agent_carrel_stops_when_keys_fail_to_load
+run_test "ssh agent carrel docker env"       test_ssh_agent_carrel_leaves_docker_your_own_agent
+run_test "ssh agent carrel refuses pkcs11"   test_ssh_agent_carrel_refuses_pkcs11_providers
+run_test "ssh agent carrel prunes old dirs"   test_ssh_agent_carrel_keeps_fresh_dirs_and_prunes_old_empty_ones
+run_test "ssh key dir hidden from project"   test_ssh_key_dir_is_hidden_from_a_project_containing_it
+run_test "ssh key dir hidden at given path"  test_ssh_key_dir_is_hidden_at_the_project_path_given
+run_test "ssh key dir hidden in mounts"      test_ssh_key_dir_is_hidden_inside_extra_mounts
+run_test "missing ssh key dir not covered"   test_missing_ssh_key_dir_is_not_mounted_over
+run_test "ssh key dir hidden in root mount"  test_ssh_key_dir_is_hidden_inside_a_root_mount
+run_test "ssh key dir hidden once per path"  test_ssh_key_dir_is_hidden_once_per_path
+run_test "ssh key dir comma path refused"    test_ssh_key_dir_behind_a_comma_path_refuses_to_launch
+run_test "mount inside ssh key dir refused"  test_mount_inside_ssh_key_dir_refuses_to_launch
+run_test "ssh agent rejects bad flag"        test_ssh_agent_rejects_unknown_flag_values
+run_test "ssh agent set rejects bad value"   test_ssh_agent_set_rejects_unknown_values
+run_test "ssh agent bad config warns"        test_ssh_agent_unknown_config_value_warns
+run_test "ssh agent host missing socket"     test_ssh_agent_host_without_socket_warns_and_launches
+run_test "ssh agent host no agent"           test_ssh_agent_host_without_agent_warns
 run_test "repo cannot set sync"              test_repo_cannot_set_sync
 run_test "sync replaces defaults"            test_sync_replaces_defaults_rather_than_appending
 run_test "set/get/add/unset roundtrip"       test_set_get_add_unset_roundtrip
@@ -551,6 +902,7 @@ run_test ".git into other worktree no mount" test_git_file_into_another_repos_wo
 run_test "-- passes the rest to claude"      test_double_dash_passes_the_rest_to_claude
 run_test "sync --dry-run writes nothing"     test_sync_dry_run_writes_nothing
 run_test "sync stays inside ~/.claude"       test_sync_refuses_paths_outside_claude_dir
+run_test "sync keeps skills/synced"          test_sync_leaves_container_downloaded_skills_alone
 
 echo
 echo "$passed passed, $failed failed"

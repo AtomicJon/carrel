@@ -20,7 +20,7 @@ VARIANTS=(base rust tauri)
 
 # Every recognised config key. Anything else in a config file is ignored with a
 # warning, and rejected outright by `carrel config set`.
-CONFIG_KEYS=(variant image tz clipboard mounts sync)
+CONFIG_KEYS=(variant image tz clipboard ssh_agent mounts sync)
 
 # Fallbacks for keys no config file sets. Unlike the file layers, these never
 # contribute to array concatenation — a config that sets `sync` replaces this
@@ -31,6 +31,7 @@ DEFAULT_CONFIG='{
   "variant": "base",
   "image": "carrel",
   "clipboard": false,
+  "ssh_agent": "off",
   "mounts": [],
   "sync": ["CLAUDE.md", "skills", "agents", "output-styles",
            "statusline-command.sh", "notify.sh"]
@@ -38,6 +39,16 @@ DEFAULT_CONFIG='{
 
 # Where the host's Wayland socket lands inside the container.
 CLIPBOARD_SOCKET=/run/carrel/wayland.sock
+
+# Where the forwarded ssh-agent socket lands inside the container.
+SSH_AGENT_SOCKET=/run/carrel/ssh-agent.sock
+
+# ssh_agent values: no agent, your own (SSH_AUTH_SOCK), or carrel's dedicated one.
+SSH_AGENT_MODES=(off host carrel)
+
+# Docker Desktop (macOS) can't bind host sockets into its VM, so it exposes the
+# host's ssh-agent at this fixed path instead.
+DOCKER_DESKTOP_SSH_SOCKET=/run/host-services/ssh-auth.sock
 
 die() {
   echo "carrel: $*" >&2
@@ -72,6 +83,13 @@ Options (each overrides the config file for one run):
                      images into Claude. Off by default (it hands the agent your
                      clipboard). Wayland only.
       --no-clipboard turn it back off for one run
+      --ssh-agent MODE
+                     forward an ssh-agent, so git can push over SSH without the
+                     key entering the container. MODE is 'host' (your agent,
+                     every key in it) or 'carrel' (an agent for this session
+                     alone, holding only the keys in \$CARREL_HOME/ssh). Off by
+                     default.
+      --no-ssh-agent turn it back off for one run
       --dry-run      print the docker command that would run, and exit
 
 Config:
@@ -160,7 +178,7 @@ config_scope_file() {
 
 config_type() {
   case "$1" in
-    variant | image | tz) printf 'string' ;;
+    variant | image | tz | ssh_agent) printf 'string' ;;
     clipboard) printf 'bool' ;;
     mounts | sync) printf 'array' ;;
     *) return 1 ;;
@@ -266,10 +284,15 @@ repo_config_restricted() {
     json="$(printf '%s' "$json" | jq 'del(.sync)')"
   fi
 
-  # Turning the clipboard off is a hint; turning it on is a decision.
+  # Turning the clipboard or ssh_agent off is a hint; turning either on is a
+  # decision.
   if [ "$(printf '%s' "$json" | jq '.clipboard == true')" = true ]; then
     echo "carrel: ignoring 'clipboard: true' in $file (only you can turn it on)" >&2
     json="$(printf '%s' "$json" | jq 'del(.clipboard)')"
+  fi
+  if [ "$(printf '%s' "$json" | jq 'has("ssh_agent") and .ssh_agent != "off"')" = true ]; then
+    echo "carrel: ignoring 'ssh_agent: $(printf '%s' "$json" | jq -c '.ssh_agent')' in $file (only you can turn it on)" >&2
+    json="$(printf '%s' "$json" | jq 'del(.ssh_agent)')"
   fi
 
   while IFS= read -r spec; do
@@ -482,6 +505,14 @@ config_write() {
   fi
 }
 
+is_ssh_agent_mode() {
+  local mode
+  for mode in "${SSH_AGENT_MODES[@]}"; do
+    [ "$1" = "$mode" ] && return 0
+  done
+  return 1
+}
+
 is_variant() {
   local variant
   for variant in "${VARIANTS[@]}"; do
@@ -495,6 +526,10 @@ config_validate() {
   case "$key" in
     variant)
       is_variant "$value" || die "unknown variant '$value' (want: ${VARIANTS[*]})"
+      ;;
+    ssh_agent)
+      is_ssh_agent_mode "$value" ||
+        die "ssh_agent takes one of ${SSH_AGENT_MODES[*]}, not '$value'"
       ;;
     clipboard)
       case "$value" in
@@ -517,6 +552,10 @@ config_check_repo_value() {
     clipboard)
       [ "$1" = true ] &&
         die "a repo config can't turn the clipboard on; use --project"
+      ;;
+    ssh_agent)
+      [ "$1" = off ] ||
+        die "a repo config can't turn ssh_agent on; use --project"
       ;;
     mounts)
       for spec in "$@"; do
@@ -760,19 +799,38 @@ do_sync() {
     esac
     src="$HOME/.claude/$item"
     [ -e "$src" ] || continue
+    # Claude Code downloads claude.ai account skills into skills/synced itself,
+    # so that folder is left alone: never copied from the host, never deleted.
+    local owned=""
+    if [ "$item" = skills ]; then
+      owned=synced
+    fi
     if command -v rsync >/dev/null 2>&1; then
       # -aL: archive + dereference symlinks. --delete (scoped to this item's own
-      # directory, never the whole config dir) mirrors host-side removals.
-      # --out-format prints only what changed.
+      # directory, never the whole config dir) mirrors host-side removals, but
+      # skips excluded paths. --out-format prints only what changed.
       if [ -d "$src" ]; then
-        rsync -aL --delete --out-format="  synced $item/%n" "$src/" "$dst/$item/"
+        rsync -aL --delete ${owned:+--exclude="/$owned/"} \
+          --out-format="  synced $item/%n" "$src/" "$dst/$item/"
       else
         rsync -aL --out-format='  synced %n' "$src" "$dst/"
       fi
     else
       # Fallback when rsync isn't installed: full replace, no change detection.
+      local kept=""
+      if [ -n "$owned" ] && [ -e "$dst/$item/$owned" ]; then
+        kept="$(mktemp -d "$dst/.carrel-keep.XXXXXX")"
+        mv "$dst/$item/$owned" "$kept/"
+      fi
       rm -rf "${dst:?}/$item"
       cp -RL "$src" "$dst/$item" && echo "  synced $item"
+      if [ -n "$owned" ]; then
+        rm -rf "${dst:?}/$item/$owned"
+      fi
+      if [ -n "$kept" ]; then
+        mv "$kept/$owned" "$dst/$item/"
+        rmdir "$kept"
+      fi
     fi
   done < <(config_get sync)
 
@@ -909,6 +967,166 @@ clipboard_args() {
   printf '%s\n' -v "$sock:$CLIPBOARD_SOCKET:rw" -e "WAYLAND_DISPLAY=$CLIPBOARD_SOCKET"
 }
 
+# Docker args giving the container an ssh-agent, printed one per line (empty
+# when off or unavailable).
+#
+# The private key stays on the host: the container can ask the agent to sign,
+# but never sees the key. It can still use every key the agent holds, against
+# any server, while the session runs. The mount is read-write because talking
+# to a socket is a write.
+ssh_agent_args() {
+  [ -n "$AGENT_SOCKET" ] || return 0
+  printf '%s\n' -v "$AGENT_SOCKET:$SSH_AGENT_SOCKET:rw" -e "SSH_AUTH_SOCK=$SSH_AGENT_SOCKET"
+}
+
+# Sets AGENT_SOCKET to the host socket the configured mode forwards: your own
+# agent for `host`, a per-session one for `carrel`, or empty.
+resolve_agent_socket() {
+  AGENT_SOCKET=""
+  case "$SSH_AGENT" in
+    host) AGENT_SOCKET="$(host_agent_socket)" || AGENT_SOCKET="" ;;
+    carrel) prepare_carrel_agent || AGENT_SOCKET="" ;;
+  esac
+}
+
+host_agent_socket() {
+  if [ "$(uname -s)" = Darwin ]; then
+    printf '%s' "$DOCKER_DESKTOP_SSH_SOCKET"
+    return 0
+  fi
+
+  if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+    echo "carrel: ssh_agent 'host' needs a running ssh-agent (SSH_AUTH_SOCK is unset); continuing without it" >&2
+    return 1
+  fi
+
+  if [ ! -S "$SSH_AUTH_SOCK" ]; then
+    echo "carrel: ssh_agent 'host' found no socket at $SSH_AUTH_SOCK; continuing without it" >&2
+    return 1
+  fi
+
+  printf '%s' "$SSH_AUTH_SOCK"
+}
+
+# Picks the keys and socket for this session's own agent: CARREL_AGENT_KEYS
+# holds the private keys in $CARREL_HOME/ssh, AGENT_SOCKET a fresh socket path.
+# The agent itself is started by launch_with_carrel_agent.
+prepare_carrel_agent() {
+  local key_dir="$CARREL_HOME/ssh" runtime_dir="${XDG_RUNTIME_DIR:-/tmp}" run_dir key
+  CARREL_AGENT_KEYS=()
+
+  if [ "$(uname -s)" = Darwin ]; then
+    echo "carrel: ssh_agent 'carrel' isn't supported on macOS (Docker Desktop can only forward your own agent); continuing without it" >&2
+    return 1
+  fi
+
+  if ! command -v ssh-agent >/dev/null 2>&1; then
+    echo "carrel: ssh_agent 'carrel' needs ssh-agent (OpenSSH) installed; continuing without it" >&2
+    return 1
+  fi
+
+  for key in "$key_dir"/id_*; do
+    if [ -f "$key" ] && [ "${key%.pub}" = "$key" ]; then
+      CARREL_AGENT_KEYS+=("$key")
+    fi
+  done
+  if [ "${#CARREL_AGENT_KEYS[@]}" = 0 ]; then
+    echo "carrel: ssh_agent 'carrel' found no keys in $key_dir; create one with" \
+      "'ssh-keygen -t ed25519 -C carrel -f $key_dir/id_ed25519'; continuing without it" >&2
+    return 1
+  fi
+
+  if [ "$dry_run" = 1 ]; then
+    AGENT_SOCKET="$runtime_dir/carrel-ssh.XXXXXX/agent.sock"
+    return 0
+  fi
+
+  # An agent removes its socket when it exits, so a dir left empty is from a
+  # finished session. The age check spares one whose agent is still starting.
+  find "$runtime_dir" -maxdepth 1 -name 'carrel-ssh.*' -type d -empty -mmin +1 -delete 2>/dev/null || true
+
+  if ! run_dir="$(mktemp -d "$runtime_dir/carrel-ssh.XXXXXX")"; then
+    echo "carrel: couldn't create a directory for carrel's ssh-agent; continuing without it" >&2
+    return 1
+  fi
+  AGENT_SOCKET="$run_dir/agent.sock"
+}
+
+# Runs the launch command under this session's own ssh-agent, loading
+# CARREL_AGENT_KEYS first (asking for any passphrase on the terminal). ssh-agent
+# runs the command itself and exits once it ends, however it ends, so nothing
+# the container does to the agent outlives the session. -P none refuses PKCS#11
+# providers, so a request from the container can't make it load a host library.
+# Docker itself runs with your own agent, as it would without carrel's.
+launch_with_carrel_agent() {
+  # shellcheck disable=SC2016
+  exec ssh-agent -P none -a "$AGENT_SOCKET" bash -c '
+    host_auth_sock="$1"
+    key_count="$2"
+    shift 2
+    if ! ssh-add "${@:1:$key_count}" >&2; then
+      echo "carrel: could not load the ssh_agent keys; not launching" >&2
+      exit 1
+    fi
+    shift "$key_count"
+    unset SSH_AGENT_PID
+    if [ -n "$host_auth_sock" ]; then
+      export SSH_AUTH_SOCK="$host_auth_sock"
+    else
+      unset SSH_AUTH_SOCK
+    fi
+    exec "$@"
+  ' carrel-ssh-agent "${SSH_AUTH_SOCK:-}" "${#CARREL_AGENT_KEYS[@]}" "${CARREL_AGENT_KEYS[@]}" "$@"
+}
+
+# Sets SSH_KEY_DIR_ARGS to docker args hiding $CARREL_HOME/ssh behind an empty
+# mount wherever a bind mount in the given docker args would otherwise carry
+# carrel's private keys into the container, and refuses to launch with a mount
+# from inside it. Paths are compared resolved, but the empty mount goes at the
+# container path as given, which is where the keys appear.
+hide_ssh_key_dir() {
+  local key_dir spec host rest container real_host prefix destination
+  local hidden=$'\n'
+  SSH_KEY_DIR_ARGS=()
+  [ -d "$CARREL_HOME/ssh" ] || return 0
+  key_dir="$(realpath -m "$CARREL_HOME/ssh")"
+
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" != -v ] || [ "$#" -lt 2 ]; then
+      shift
+      continue
+    fi
+    spec="$2"
+    shift 2
+    host="${spec%%:*}"
+    rest="${spec#*:}"
+    container="${rest%%:*}"
+    [[ "$host" == /* ]] || continue
+
+    real_host="$(realpath -m "$host")"
+    prefix="${real_host%/}/"
+    if [[ "$real_host" == "$key_dir"/* ]]; then
+      die "refusing to mount $real_host: it's inside carrel's ssh key dir"
+    elif [ "$key_dir" = "$real_host" ]; then
+      destination="$container"
+    elif [[ "$key_dir" == "$prefix"* ]]; then
+      destination="${container%/}/${key_dir#"$prefix"}"
+    else
+      continue
+    fi
+
+    # --mount splits its value on commas and stops at a newline, so such a path
+    # can't be hidden.
+    case "$destination" in
+      *,* | *'"'* | *$'\n'*) die "can't hide $key_dir at '$destination' in the container; rename the mount's container path" ;;
+    esac
+    if [[ "$hidden" != *$'\n'"$destination"$'\n'* ]]; then
+      hidden+="$destination"$'\n'
+      SSH_KEY_DIR_ARGS+=(--mount "type=tmpfs,destination=$destination")
+    fi
+  done
+}
+
 # Docker args mounting the main checkout's .git dir when running in a linked
 # worktree, printed one per line (empty otherwise). A worktree's .git is only a
 # file pointing into that dir, which holds the objects, refs and the worktree's
@@ -974,6 +1192,8 @@ fi
 flag_image=""
 flag_tz=""
 flag_clipboard=""
+flag_ssh_agent=""
+flag_ssh_agent_given=0
 flag_mounts=()
 dry_run=0
 remaining=()
@@ -1018,6 +1238,22 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-clipboard)
       flag_clipboard=false
+      shift
+      ;;
+    --ssh-agent)
+      [ "$#" -ge 2 ] || die "--ssh-agent needs a mode (host or carrel)"
+      flag_ssh_agent="$2"
+      flag_ssh_agent_given=1
+      shift 2
+      ;;
+    --ssh-agent=*)
+      flag_ssh_agent="${1#--ssh-agent=}"
+      flag_ssh_agent_given=1
+      shift
+      ;;
+    --no-ssh-agent)
+      flag_ssh_agent=off
+      flag_ssh_agent_given=1
       shift
       ;;
     --dry-run)
@@ -1077,6 +1313,17 @@ config_load
 
 IMAGE_NAME="${flag_image:-$(config_get image)}"
 CLIPBOARD="${flag_clipboard:-$(config_get clipboard)}"
+if [ "$flag_ssh_agent_given" = 1 ]; then
+  is_ssh_agent_mode "$flag_ssh_agent" ||
+    die "--ssh-agent takes one of ${SSH_AGENT_MODES[*]}, not '$flag_ssh_agent'"
+  SSH_AGENT="$flag_ssh_agent"
+else
+  SSH_AGENT="$(config_get ssh_agent)"
+  if ! is_ssh_agent_mode "$SSH_AGENT"; then
+    echo "carrel: unknown ssh_agent '$SSH_AGENT' (want: ${SSH_AGENT_MODES[*]}); continuing without it" >&2
+    SSH_AGENT=off
+  fi
+fi
 TZ_OVERRIDE="${flag_tz:-$(config_get tz)}"
 [ -n "$tag" ] || tag="$(config_get variant)"
 
@@ -1102,6 +1349,10 @@ tz="$(host_timezone)"
 clip_args=()
 while IFS= read -r arg; do clip_args+=("$arg"); done < <(clipboard_args)
 
+resolve_agent_socket
+ssh_agent_mount_args=()
+while IFS= read -r arg; do ssh_agent_mount_args+=("$arg"); done < <(ssh_agent_args)
+
 worktree_mount_args=()
 while IFS= read -r arg; do worktree_mount_args+=("$arg"); done < <(worktree_args)
 
@@ -1109,6 +1360,7 @@ run=(
   docker run --rm -it -w "$PWD"
   ${tz_args[@]+"${tz_args[@]}"}
   ${clip_args[@]+"${clip_args[@]}"}
+  ${ssh_agent_mount_args[@]+"${ssh_agent_mount_args[@]}"}
   -v "$CARREL_HOME/claude":/home/claude/.claude
   -v "$CARREL_HOME/claude.json":/home/claude/.claude.json
   -v "$CARREL_HOME/opencode/config":/home/claude/.config/opencode
@@ -1121,8 +1373,11 @@ run=(
   -v "$PWD":"$PWD"
   ${worktree_mount_args[@]+"${worktree_mount_args[@]}"}
   ${mount_args[@]+"${mount_args[@]}"}
-  "${IMAGE_NAME}:${tag}"
 )
+
+# Worked out from the finished mount list, so no bind mount can skip it.
+hide_ssh_key_dir "${run[@]}"
+run+=(${SSH_KEY_DIR_ARGS[@]+"${SSH_KEY_DIR_ARGS[@]}"} "${IMAGE_NAME}:${tag}")
 
 if [ "$launch" = shell ]; then
   run+=(bash)
@@ -1136,6 +1391,10 @@ if [ "$dry_run" = 1 ]; then
   printf '%q ' "${run[@]}"
   printf '\n'
   exit 0
+fi
+
+if [ "$SSH_AGENT" = carrel ] && [ -n "$AGENT_SOCKET" ]; then
+  launch_with_carrel_agent "${run[@]}"
 fi
 
 exec "${run[@]}"
