@@ -150,7 +150,7 @@ config carries over.
 
 ### Settings
 
-Everything carrel does is driven by seven keys, read from JSON config files and
+Everything carrel does is driven by eight keys, read from JSON config files and
 managed with `carrel config`:
 
 | Key         | Type   | Default        | What it does                            |
@@ -162,6 +162,7 @@ managed with `carrel config`:
 | `ssh_agent` | string | `off`          | forward an ssh-agent: `host`/`carrel`   |
 | `mounts`    | list   | `[]`           | extra host items to pass in             |
 | `sync`      | list   | see below      | what's mirrored from your `~/.claude`   |
+| `vm_group`  | string | none           | share a VM between sessions ([carrel-vm](#incus-vms-experimental) only) |
 
 ```bash
 carrel config get                       # every effective setting
@@ -264,6 +265,7 @@ project's own:
 | `ssh_agent: "off"`             | honoured                                        |
 | `ssh_agent: "host"`/`"carrel"` | **ignored**, with a warning                     |
 | `sync`                         | **ignored**, with a warning                     |
+| `vm_group`                     | **ignored**, with a warning                     |
 
 `~` and `$VAR` are refused outright, and both sides of the "inside the project"
 test go through `realpath`, so a symlink planted in the repo can't point out of
@@ -634,9 +636,9 @@ entrypoint, and puts everything at the same paths inside the VM. `config`,
 
 Differences from the Docker launcher:
 
-- **One VM per session.** Each launch boots a fresh ephemeral VM (a few
-  seconds) and Incus deletes it when it stops. Size it with `--cpus` /
-  `--memory`.
+- **One VM per session**, unless you group them (below). Each launch boots a
+  fresh ephemeral VM (a few seconds) and Incus deletes it when it stops. Size it
+  with `--cpus` / `--memory`.
 - **Volumes** (`carrel-claude`, `carrel-node`, …) are Incus storage volumes in
   the `default` pool (`CARREL_INCUS_POOL` to change it).
 - **Single-file mounts are copied in**, since VMs can only share directories.
@@ -660,7 +662,25 @@ cat ~/.carrel/vm-ssh/id_ed25519.pub        # add this to GitLab / GitHub
 ```
 
 `~/.carrel/ssh` (the keys for `carrel` mode) is never shared with a VM. It's
-covered with an empty folder if a share would carry it in.
+covered with an empty folder if a share would carry it in, and a session can't
+join a running group VM with such a share, since the others would see the keys
+before they could be covered.
+
+**Sharing a VM.** Sessions in the same group run in one VM, so agents working
+on related code can read each other's projects, reach each other's dev servers
+on `localhost`, and leave notes in a shared `/tmp`:
+
+```bash
+carrel-vm config set --project vm_group @repo   # every worktree of this repo
+carrel-vm --group web                           # any projects you name "web"
+carrel-vm --no-group                            # this run on its own
+```
+
+The first session starts the VM; later ones join it and add their own project
+and mounts, which every member can then see. The VM's variant is fixed by
+whoever started it, and the last session out deletes it. A repo's
+`.carrel.json` can't set `vm_group`: joining a group shows the agent your other
+projects, so that's your call.
 
 ## Building
 

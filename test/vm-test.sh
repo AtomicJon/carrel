@@ -114,6 +114,77 @@ test_project_is_shared_at_its_host_path() {
   assert_contains "$out" "path=$PROJECT source=$PROJECT readonly=false"
 }
 
+test_worktrees_share_the_repo_group_vm() {
+  local main_vm worktree_vm
+  git -C "$PROJECT" worktree add -q "$SANDBOX/wt"
+
+  main_vm="$(planned_vm --group @repo)"
+  worktree_vm="$(cd "$SANDBOX/wt" && planned_vm --group @repo)"
+
+  assert_contains "$main_vm" "carrel-repo-project-"
+  assert_equals "$worktree_vm" "$main_vm"
+}
+
+test_repo_group_differs_between_repos() {
+  local this_vm other_vm
+  git init -q "$SANDBOX/other"
+
+  this_vm="$(planned_vm --group @repo)"
+  other_vm="$(cd "$SANDBOX/other" && planned_vm --group @repo)"
+
+  assert_not_equals "$other_vm" "$this_vm"
+}
+
+test_crafted_git_file_cannot_join_another_repos_group() {
+  local victim_vm attacker_vm
+  victim_vm="$(planned_vm --group @repo)"
+  mkdir -p "$SANDBOX/attacker/.fake"
+  echo 'ref: refs/heads/main' >"$SANDBOX/attacker/.fake/HEAD"
+  printf '%s\n' "$PROJECT/.git" >"$SANDBOX/attacker/.fake/commondir"
+  echo 'gitdir: ./.fake' >"$SANDBOX/attacker/.git"
+
+  attacker_vm="$(cd "$SANDBOX/attacker" && planned_vm --group @repo)"
+
+  assert_not_equals "$attacker_vm" "$victim_vm"
+}
+
+test_named_group_from_config() {
+  "$CARREL_VM" config set --project vm_group sibling >/dev/null
+
+  assert_equals "$(planned_vm)" "carrel-group-sibling"
+}
+
+test_no_group_flag_overrides_config() {
+  "$CARREL_VM" config set --project vm_group sibling >/dev/null
+
+  assert_not_equals "$(planned_vm --no-group)" "carrel-group-sibling"
+}
+
+test_group_name_is_validated() {
+  local err
+
+  err="$(carrel_vm --dry-run --group 'a b' 2>&1)" && fail "expected a nonzero exit"
+
+  assert_contains "$err" "letters, digits and dashes"
+}
+
+test_group_vm_records_its_image() {
+  local out
+
+  out="$(carrel_vm --dry-run --group sibling rust 2>/dev/null)"
+
+  assert_contains "$out" "user.carrel.image=carrel-rust"
+}
+
+test_shares_are_named_after_what_they_share() {
+  local first second
+
+  first="$(carrel_vm --dry-run --group sibling 2>/dev/null | grep "path=$PROJECT ")"
+  second="$(carrel_vm --dry-run --group sibling 2>/dev/null | grep "path=$PROJECT ")"
+
+  assert_equals "$second" "$first"
+}
+
 test_file_mounts_are_copied_in() {
   local out
   echo '[user]' >"$SANDBOX/gitconfig"
@@ -174,6 +245,14 @@ test_socket_flags_are_refused() {
 run_test "own vm by default"                  test_each_session_gets_its_own_vm_by_default
 run_test "vm is ephemeral"                    test_vm_is_ephemeral
 run_test "project shared at host path"        test_project_is_shared_at_its_host_path
+run_test "worktrees share the repo group"     test_worktrees_share_the_repo_group_vm
+run_test "repo group differs between repos"   test_repo_group_differs_between_repos
+run_test "crafted .git can't join a group"    test_crafted_git_file_cannot_join_another_repos_group
+run_test "named group from config"            test_named_group_from_config
+run_test "--no-group overrides config"        test_no_group_flag_overrides_config
+run_test "group name is validated"            test_group_name_is_validated
+run_test "group vm records its image"         test_group_vm_records_its_image
+run_test "shares named after what they share" test_shares_are_named_after_what_they_share
 run_test "file mounts are copied in"          test_file_mounts_are_copied_in
 run_test "vm ssh dir shared read-only"        test_vm_ssh_dir_is_shared_read_only
 run_test "no ssh share without vm-ssh"        test_no_ssh_share_without_a_vm_ssh_dir

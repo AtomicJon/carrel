@@ -678,6 +678,16 @@ test_repo_scope_writes_and_trusts_repo_config() {
   assert_contains "$(carrel --dry-run 2>/dev/null)" "carrel:base"
 }
 
+test_repo_cannot_set_vm_group() {
+  write_repo_config '{"vm_group": "work"}'
+
+  local err
+  err="$(carrel config get vm_group 2>&1 >/dev/null)"
+
+  assert_equals "$(carrel config get vm_group 2>/dev/null)" ""
+  assert_contains "$err" "only you can choose which projects share a VM"
+}
+
 test_repo_scope_rejects_what_a_repo_cannot_set() {
   local err
   err="$(carrel config add --repo mounts ~/.ssh:/home/claude/.ssh 2>&1)" &&
@@ -692,6 +702,9 @@ test_repo_scope_rejects_what_a_repo_cannot_set() {
 
   err="$(carrel config set --repo sync CLAUDE.md 2>&1)" && fail "expected a nonzero exit"
   assert_contains "$err" "sync"
+
+  err="$(carrel config set --repo vm_group work 2>&1)" && fail "expected a nonzero exit"
+  assert_contains "$err" "vm_group"
 
   [ -f "$PROJECT/.carrel.json" ] && fail "expected no repo config to be written"
 }
@@ -868,6 +881,7 @@ run_test "ssh agent bad config warns"        test_ssh_agent_unknown_config_value
 run_test "ssh agent host missing socket"     test_ssh_agent_host_without_socket_warns_and_launches
 run_test "ssh agent host no agent"           test_ssh_agent_host_without_agent_warns
 run_test "repo cannot set sync"              test_repo_cannot_set_sync
+run_test "repo cannot set vm_group"          test_repo_cannot_set_vm_group
 run_test "sync replaces defaults"            test_sync_replaces_defaults_rather_than_appending
 run_test "set/get/add/unset roundtrip"       test_set_get_add_unset_roundtrip
 run_test "set rejects bad input"             test_set_rejects_bad_input
