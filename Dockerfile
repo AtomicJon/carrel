@@ -19,6 +19,9 @@
 # =============================================================================
 FROM debian:stable-20260610-slim AS base
 
+# Keep in step with vm/base.sh, which builds the carrel-vm equivalent: a tool
+# added to one belongs in the other.
+
 ARG NVM_VERSION=v0.40.1
 ARG GLAB_VERSION=1.108.0
 
@@ -138,6 +141,9 @@ CMD ["claude"]
 # =============================================================================
 FROM base AS rust
 
+# Keep in step with vm/rust.sh, which builds the carrel-vm equivalent: a tool
+# added to one belongs in the other.
+
 ARG RUST_TOOLCHAIN=stable
 
 ENV RUSTUP_HOME=/home/claude/.rustup \
@@ -165,6 +171,9 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
 # tauri  — Rust + web toolchain + desktop build deps
 # =============================================================================
 FROM rust AS tauri
+
+# Keep in step with vm/tauri.sh, which builds the carrel-vm equivalent: a tool
+# added to one belongs in the other.
 
 # Tauri v2 Linux system dependencies.
 USER root

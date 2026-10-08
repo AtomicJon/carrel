@@ -8,7 +8,8 @@
 #   make shell [TAG=base]                open a shell instead of Claude
 #   make sync                            push host config into carrel's own dir
 #   make sessions                        print where session history lives
-#   make test                            run the config-layering tests
+#   make test                            run the config and VM launcher tests
+#   make vm    [TAG=…]                   build Incus VM images (default: all)
 
 IMAGE       ?= carrel
 TAG         ?= base
@@ -21,7 +22,7 @@ VARIANTS    := $(shell sed -n 's/^VARIANTS=(\(.*\))$$/\1/p' $(CURDIR)/bin/carrel
 # an env var because it's what locates the config; everything else is a flag.
 CARREL := CARREL_HOME=$(CARREL_HOME) $(CURDIR)/bin/carrel --image $(IMAGE)
 
-.PHONY: all $(VARIANTS) run shell sync sessions test
+.PHONY: all $(VARIANTS) run shell sync sessions test vm
 
 all: $(VARIANTS)
 	@echo
@@ -45,3 +46,7 @@ sessions:
 
 test:
 	@$(CURDIR)/test/config-test.sh
+	@$(CURDIR)/test/vm-test.sh
+
+vm:
+	@CARREL_HOME=$(CARREL_HOME) $(CURDIR)/bin/carrel-vm --image $(IMAGE) build $(if $(filter command line,$(origin TAG)),$(TAG))

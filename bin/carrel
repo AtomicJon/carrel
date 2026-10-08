@@ -1165,6 +1165,11 @@ session_dir() {
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+# Sourced as a library (bin/carrel-vm): stop at the definitions above.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
 # Help needs neither jq nor a config, so answer it before either is touched.
 for arg in "$@"; do
   case "$arg" in
