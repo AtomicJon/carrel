@@ -18,6 +18,8 @@
 #     ssh-agent forwarding. VMs get keys of their own instead (VM_SSH_DIR).
 #   - ~/.claude.json can't be a single-file mount, so Claude is pointed at
 #     CLAUDE_CONFIG_DIR, which keeps that file inside the shared ~/.claude.
+#   - Sessions can share a VM (the `vm_group` setting), so agents working on
+#     worktrees or sibling projects can see each other's files and processes.
 
 set -euo pipefail
 
@@ -47,6 +49,17 @@ GUEST_PATH="$GUEST_HOME/.cargo/bin:$GUEST_HOME/.local/bin:$GUEST_HOME/.opencode/
 # How long to wait for a booting VM's agent, in half-second polls.
 VM_BOOT_POLLS=240
 
+# How long to wait for a share added to a running VM to appear, in half-second
+# polls.
+VM_MOUNT_POLLS=20
+
+# Locks and session records for running VMs. Beside $CARREL_HOME/claude rather
+# than inside it, so no VM can see or forge them.
+VM_STATE_DIR="$CARREL_HOME/vm"
+
+# The vm_group value that means "every worktree of this repo".
+REPO_GROUP=@repo
+
 vm_usage() {
   local variants="${VARIANTS[*]}"
   cat <<EOF
@@ -62,6 +75,11 @@ Usage:
 config, trust, sync and sessions are shared with carrel and passed straight to
 it, e.g. 'carrel-vm config get'.
 
+Each session gets its own throwaway VM unless it's in a group (vm_group, or
+--group). The first session in a group starts its VM, later ones join it and
+add their own project, and the last one out deletes it. Everything any member
+mounts is visible to all of them while the VM runs.
+
 Options:
   -m, --mount SPEC   pass an extra host item into the VM (repeatable).
                      SPEC is HOST[:GUEST][:ro|:rw]; read-only by default.
@@ -70,6 +88,10 @@ Options:
       --tz ZONE      guest timezone
       --cpus N       vCPUs                    (default: $VM_DEFAULT_CPUS)
       --memory SIZE  memory, e.g. 16GiB       (default: $VM_DEFAULT_MEMORY)
+      --group NAME   share a VM with every session in group NAME, or use
+                     '$REPO_GROUP' to share one between this repo's worktrees.
+                     Overrides the vm_group setting.
+      --no-group     run in a VM of its own, whatever vm_group says
       --dry-run      print the incus commands that would run, and exit
 
 Env:
@@ -168,22 +190,141 @@ cmd_build() {
   done
 }
 
+# ─── VM groups ────────────────────────────────────────────────────────────────
+
+short_hash() {
+  printf '%s' "$1" | sha256sum | cut -c1-8
+}
+
+# Lowercase, with anything outside [a-z0-9] turned to a dash, so it's usable in
+# an instance name.
+name_part() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | cut -c1-30
+}
+
+# The git dir every worktree of this repo shares, or the project root outside
+# git. A linked worktree's pointer to it is a file inside the project, which the
+# agent can write, so it's only followed once worktree_args has checked it's
+# the layout `git worktree add` creates. Otherwise the worktree keeps to itself
+# rather than joining whichever repo it claims to belong to.
+repo_group_key() {
+  local git_dir common_dir spec
+  if ! git_dir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)"; then
+    project_root
+    return 0
+  fi
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+  if [ "$git_dir" = "$common_dir" ]; then
+    realpath -m "$common_dir"
+    return 0
+  fi
+
+  spec="$(worktree_args | sed -n 2p)"
+  if [ -n "$spec" ]; then
+    printf '%s' "${spec%%:*}"
+  else
+    realpath -m "$git_dir"
+  fi
+}
+
+# Sets VM_NAME and VM_SHARED for a group: empty for a VM of this session's own,
+# $REPO_GROUP for this repo's, anything else a name of your choosing.
+resolve_vm_name() {
+  local group="$1" key checkout
+  VM_SHARED=1
+  case "$group" in
+    "")
+      VM_SHARED=0
+      VM_NAME="carrel-$tag-$(random_suffix)"
+      ;;
+    "$REPO_GROUP")
+      key="$(repo_group_key)"
+      checkout="$key"
+      [ "$(basename "$key")" != .git ] || checkout="$(dirname "$key")"
+      VM_NAME="carrel-repo-$(name_part "$(basename "$checkout")")-$(short_hash "$key")"
+      ;;
+    *)
+      [[ "$group" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,39}$ ]] ||
+        die "vm_group '$group' should be letters, digits and dashes (at most 40), or $REPO_GROUP"
+      VM_NAME="carrel-group-$(name_part "$group")"
+      ;;
+  esac
+}
+
+# Starting, joining and leaving a VM all happen under one lock per VM, so two
+# sessions can't both create it, or delete it under each other.
+lock_vm() {
+  [ -z "${VM_LOCK_FD:-}" ] || return 0
+  mkdir -p "$VM_STATE_DIR"
+  exec {VM_LOCK_FD}>"$VM_STATE_DIR/$VM_NAME.lock"
+  flock "$VM_LOCK_FD"
+}
+
+unlock_vm() {
+  [ -n "${VM_LOCK_FD:-}" ] || return 0
+  exec {VM_LOCK_FD}>&-
+  VM_LOCK_FD=""
+}
+
+sessions_dir() { printf '%s/%s.sessions' "$VM_STATE_DIR" "$VM_NAME"; }
+
+# How many sessions are using the VM, forgetting any whose launcher has gone
+# (killed before it could sign out).
+live_sessions() {
+  local record count=0
+  for record in "$(sessions_dir)"/*; do
+    [ -f "$record" ] || continue
+    if kill -0 "$(basename "$record")" 2>/dev/null; then
+      count=$((count + 1))
+    else
+      rm -f "$record"
+    fi
+  done
+  printf '%s' "$count"
+}
+
+vm_status() {
+  incus query "/1.0/instances/$VM_NAME/state" 2>/dev/null | jq -r '.status // empty'
+}
+
+leave_vm() {
+  [ "$dry_run" = 0 ] && [ -n "${VM_NAME:-}" ] || return 0
+  lock_vm
+  rm -f "$(sessions_dir)/$$"
+  if [ "$(live_sessions)" = 0 ]; then
+    incus delete --force "$VM_NAME" >/dev/null 2>&1 || true
+    rmdir "$(sessions_dir)" 2>/dev/null || true
+  fi
+  unlock_vm
+}
+
 # ─── Launching ────────────────────────────────────────────────────────────────
 
 SHARES=()        # resolved host:guest:mode specs, attached once the VM exists
 FILE_COPIES=()   # host:guest pairs, copied in once the VM is up
 VOLUME_PATHS=()  # guest paths of volumes, chowned to the guest user at boot
 HIDDEN_PATHS=()  # guest paths covered with an empty tmpfs before the agent runs
-device_count=0
+HOTPLUGGED=()    # guest paths shared into an already running VM
+EXISTING_DEVICES=""
+VM_JOINED=0      # 1 when the group's VM was already running
 
+# Devices are named after what they share, so a session joining a VM can tell
+# which of its shares another session already added.
 add_device() {
-  device_count=$((device_count + 1))
-  local path="$1"
+  local device path="$1"
+  device="carrel-$(short_hash "$*")"
   shift
+  if printf '%s\n' "$EXISTING_DEVICES" | grep -qx "$device"; then
+    return 0
+  fi
   if [ "$dry_run" = 1 ]; then
-    incus_do config device add "$VM_NAME" "carrel$device_count" disk "path=$path" "$@"
-  else
-    incus config device add "$VM_NAME" "carrel$device_count" disk "path=$path" "$@" >/dev/null
+    incus_do config device add "$VM_NAME" "$device" disk "path=$path" "$@"
+    return 0
+  fi
+  incus config device add "$VM_NAME" "$device" disk "path=$path" "$@" >/dev/null ||
+    die "couldn't share $path into $VM_NAME (is another session in the group using that path for something else?)"
+  if [ "$VM_JOINED" = 1 ]; then
+    HOTPLUGGED+=("$path")
   fi
 }
 
@@ -219,6 +360,12 @@ plan_hidden_paths() {
   done
 }
 
+# Whether sharing this resolved spec would show the VM $CARREL_HOME/ssh.
+carries_ssh_key_dir() {
+  hide_ssh_key_dir -v "$1"
+  [ "${#SSH_KEY_DIR_ARGS[@]}" -gt 0 ]
+}
+
 # Attach one resolved mount (host:guest:mode, as resolve_mount prints it).
 attach_share() {
   local resolved="$1" rest host guest mode readonly=false
@@ -242,9 +389,14 @@ attach_share() {
   fi
 }
 
+# A share added to a running VM is visible to every session in it the moment
+# it lands, before it can be covered, so one carrying the key dir is refused.
 attach_shares() {
   local resolved
   for resolved in "${SHARES[@]}"; do
+    if [ "$VM_JOINED" = 1 ] && carries_ssh_key_dir "$resolved"; then
+      die "can't add ${resolved%%:*} to the running $VM_NAME: it holds $CARREL_HOME/ssh, which the other sessions would see; use another group or run from elsewhere"
+    fi
     attach_share "$resolved"
   done
 }
@@ -257,6 +409,22 @@ seed_claude_json() {
   if [ ! -f "$seeded" ] && [ -f "$CARREL_HOME/claude.json" ]; then
     cp "$CARREL_HOME/claude.json" "$seeded"
   fi
+}
+
+# Shares added to a running VM are mounted by its agent in the background, so
+# wait for them before handing over to the session.
+wait_for_hotplugged() {
+  local path polls
+  for path in ${HOTPLUGGED[@]+"${HOTPLUGGED[@]}"}; do
+    polls=0
+    until incus exec "$VM_NAME" -- mountpoint -q "$path" >/dev/null 2>&1; do
+      polls=$((polls + 1))
+      if [ "$polls" -ge "$VM_MOUNT_POLLS" ]; then
+        die "$path didn't appear in $VM_NAME"
+      fi
+      sleep 0.5
+    done
+  done
 }
 
 # Root-only setup before the agent starts: hand fresh volumes to the guest user
@@ -272,7 +440,7 @@ prepare_guest() {
     hidden="$2"
     shift 2
     printf "%s\n" "$hidden" | while IFS= read -r dir; do
-      if [ -n "$dir" ] && [ -d "$dir" ]; then
+      if [ -n "$dir" ] && [ -d "$dir" ] && ! mountpoint -q "$dir"; then
         mount -t tmpfs tmpfs "$dir"
       fi
     done
@@ -287,10 +455,32 @@ prepare_guest() {
   done
 }
 
-remove_vm() {
-  if [ "$dry_run" = 0 ]; then
-    incus delete --force "$VM_NAME" >/dev/null 2>&1 || true
+# Creates the VM, or joins it if the group's is already running. Ephemeral:
+# Incus deletes it as soon as it stops, the equivalent of --rm.
+start_or_join_vm() {
+  local image="${IMAGE_NAME}-$tag" status running_image
+  status=""
+  [ "$dry_run" = 1 ] || status="$(vm_status)"
+
+  if [ "$status" = Running ]; then
+    running_image="$(incus config get "$VM_NAME" user.carrel.image)"
+    [ "$running_image" = "$image" ] ||
+      die "$VM_NAME is running $running_image, not $image; use the same variant or another group"
+    EXISTING_DEVICES="$(incus config device list "$VM_NAME")"
+    VM_JOINED=1
+    echo "carrel-vm: joining $VM_NAME" >&2
+    return 0
   fi
+
+  if [ -n "$status" ]; then
+    incus delete --force "$VM_NAME" >/dev/null
+  fi
+  if [ "$dry_run" = 1 ] && [ "$VM_SHARED" = 1 ]; then
+    echo "# joins $VM_NAME if it's running, otherwise:"
+  fi
+  incus_do init "$image" "$VM_NAME" --vm --ephemeral \
+    -c "limits.cpu=$VM_CPUS" -c "limits.memory=$VM_MEMORY" \
+    -c "user.carrel.image=$image"
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -314,6 +504,8 @@ require_jq
 flag_image=""
 flag_tz=""
 flag_mounts=()
+flag_group=""
+flag_group_given=0
 VM_CPUS="$VM_DEFAULT_CPUS"
 VM_MEMORY="$VM_DEFAULT_MEMORY"
 dry_run=0
@@ -362,6 +554,22 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die "--memory needs a size"
       VM_MEMORY="$2"
       shift 2
+      ;;
+    --group)
+      [ "$#" -ge 2 ] || die "--group needs a name (or $REPO_GROUP)"
+      flag_group="$2"
+      flag_group_given=1
+      shift 2
+      ;;
+    --group=*)
+      flag_group="${1#--group=}"
+      flag_group_given=1
+      shift
+      ;;
+    --no-group)
+      flag_group=""
+      flag_group_given=1
+      shift
       ;;
     --clipboard | --ssh-agent | --ssh-agent=*)
       die "$1 isn't supported in a VM: Incus can't forward Unix sockets into one (VMs use the keys in $VM_SSH_DIR instead)"
@@ -415,6 +623,11 @@ config_load
 IMAGE_NAME="${flag_image:-$(config_get image)}"
 TZ_OVERRIDE="${flag_tz:-$(config_get tz)}"
 [ -n "$tag" ] || tag="$(config_get variant)"
+if [ "$flag_group_given" = 1 ]; then
+  VM_GROUP="$flag_group"
+else
+  VM_GROUP="$(config_get vm_group)"
+fi
 
 if [ "$(config_get clipboard)" = true ]; then
   echo "carrel-vm: clipboard isn't supported in a VM; continuing without it" >&2
@@ -462,12 +675,15 @@ for spec in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
 done
 
 plan_hidden_paths
-VM_NAME="carrel-$tag-$(random_suffix)"
-trap remove_vm EXIT
+resolve_vm_name "$VM_GROUP"
 
-# Ephemeral: Incus deletes the VM as soon as it stops, the equivalent of --rm.
-incus_do init "${IMAGE_NAME}-$tag" "$VM_NAME" --vm --ephemeral \
-  -c "limits.cpu=$VM_CPUS" -c "limits.memory=$VM_MEMORY"
+if [ "$dry_run" = 0 ]; then
+  lock_vm
+  mkdir -p "$(sessions_dir)"
+  touch "$(sessions_dir)/$$"
+  trap leave_vm EXIT
+fi
+start_or_join_vm
 attach_shares
 
 exec_env=(
@@ -492,9 +708,14 @@ case "$launch" in
   *) agent=(claude "$@" ${passthrough[@]+"${passthrough[@]}"}) ;;
 esac
 
-incus_do start "$VM_NAME"
-[ "$dry_run" = 1 ] || wait_for_agent "$VM_NAME"
+if [ "$VM_JOINED" = 0 ]; then
+  incus_do start "$VM_NAME"
+  [ "$dry_run" = 1 ] || wait_for_agent "$VM_NAME"
+else
+  wait_for_hotplugged
+fi
 prepare_guest
+unlock_vm
 
 status=0
 incus_do exec "$VM_NAME" --user "$GUEST_UID" --group "$GUEST_UID" --cwd "$PWD" \

@@ -20,7 +20,7 @@ VARIANTS=(base rust tauri)
 
 # Every recognised config key. Anything else in a config file is ignored with a
 # warning, and rejected outright by `carrel config set`.
-CONFIG_KEYS=(variant image tz clipboard ssh_agent mounts sync)
+CONFIG_KEYS=(variant image tz clipboard ssh_agent mounts sync vm_group)
 
 # Fallbacks for keys no config file sets. Unlike the file layers, these never
 # contribute to array concatenation — a config that sets `sync` replaces this
@@ -178,7 +178,7 @@ config_scope_file() {
 
 config_type() {
   case "$1" in
-    variant | image | tz | ssh_agent) printf 'string' ;;
+    variant | image | tz | ssh_agent | vm_group) printf 'string' ;;
     clipboard) printf 'bool' ;;
     mounts | sync) printf 'array' ;;
     *) return 1 ;;
@@ -282,6 +282,13 @@ repo_config_restricted() {
   if [ "$(printf '%s' "$json" | jq 'has("sync")')" = true ]; then
     echo "carrel: ignoring 'sync' in $file (only you can choose what's synced)" >&2
     json="$(printf '%s' "$json" | jq 'del(.sync)')"
+  fi
+
+  # A VM group shares one VM between projects, so joining one shows this repo's
+  # agent your other projects.
+  if [ "$(printf '%s' "$json" | jq 'has("vm_group")')" = true ]; then
+    echo "carrel: ignoring 'vm_group' in $file (only you can choose which projects share a VM)" >&2
+    json="$(printf '%s' "$json" | jq 'del(.vm_group)')"
   fi
 
   # Turning the clipboard or ssh_agent off is a hint; turning either on is a
@@ -548,6 +555,9 @@ config_check_repo_value() {
   case "$key" in
     sync)
       die "a repo config can't set 'sync' (only you can choose what's synced); use --project"
+      ;;
+    vm_group)
+      die "a repo config can't set 'vm_group' (only you can choose which projects share a VM); use --project"
       ;;
     clipboard)
       [ "$1" = true ] &&
