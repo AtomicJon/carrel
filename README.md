@@ -615,6 +615,53 @@ Session IDs are the `*.jsonl` filenames under the project's sessions directory
 pass-through covers other flags too — `carrel -p "..."`, `carrel --model …`, etc.
 With `make`: `make run ARGS="--resume <id>"`.
 
+## Incus VMs (experimental)
+
+`carrel-vm` runs the same setup in a throwaway [Incus](https://linuxcontainers.org/incus/)
+virtual machine instead of a Docker container. A container shares your
+kernel, so a kernel bug is a way out; a VM has its own kernel behind a
+hypervisor, which is a much harder wall to get through.
+
+```bash
+carrel-vm build                 # build carrel-base, -rust, -tauri VM images
+ln -s "$PWD/bin/carrel-vm" ~/.local/bin/carrel-vm
+carrel-vm rust                  # one fresh VM per session, deleted on exit
+```
+
+It shares carrel's config files, trust prompts, `~/.carrel` directory and
+entrypoint, and puts everything at the same paths inside the VM. `config`,
+`trust`, `sync` and `sessions` are passed straight to `carrel`.
+
+Differences from the Docker launcher:
+
+- **One VM per session.** Each launch boots a fresh ephemeral VM (a few
+  seconds) and Incus deletes it when it stops. Size it with `--cpus` /
+  `--memory`.
+- **Volumes** (`carrel-claude`, `carrel-node`, …) are Incus storage volumes in
+  the `default` pool (`CARREL_INCUS_POOL` to change it).
+- **Single-file mounts are copied in**, since VMs can only share directories.
+  Edits to them stay in the VM.
+- **No clipboard or ssh-agent forwarding.** Incus can't forward Unix sockets
+  into a VM. For git over SSH, give the VMs keys of their own instead (below).
+- **Claude's `~/.claude.json`** lives in `~/.carrel/claude/.claude.json`
+  (seeded once from `~/.carrel/claude.json`), so the two launchers keep
+  separate onboarding state but share the login.
+
+**SSH keys.** If `~/.carrel/vm-ssh` exists, every VM gets it read-only as
+`~/.ssh`. Unlike `carrel` mode's agent, the private key is in the VM, where the
+agent can read or copy it, so treat it as the agent's key: register it with
+only the access you'd give the agent, e.g. a deploy key on specific repos.
+
+```bash
+mkdir -p ~/.carrel/vm-ssh
+ssh-keygen -t ed25519 -C carrel-vm -N '' -f ~/.carrel/vm-ssh/id_ed25519
+ssh-keyscan github.com gitlab.com > ~/.carrel/vm-ssh/known_hosts
+cat ~/.carrel/vm-ssh/id_ed25519.pub        # add this to GitLab / GitHub
+```
+
+`~/.carrel/ssh` (the keys for `carrel` mode) is never shared with a VM. It's
+covered with an empty folder if a share would carry it in.
+
 ## Building
 
 Everything is one multi-target `Dockerfile`. Build a single variant by

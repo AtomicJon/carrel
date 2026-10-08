@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+#
+# carrel-vm — carrel, but the agent runs in a throwaway Incus virtual machine
+# instead of a Docker container.
+#
+# A container shares the host's kernel, so a kernel bug is a way out. A VM has
+# its own kernel behind a hypervisor, which is a much smaller and better-tested
+# boundary. Everything else follows carrel: the same config files and trust
+# model, the same CARREL_HOME, the same paths inside the guest, and the same
+# entrypoint. The config, trust, sync and mount-parsing code is bin/carrel's,
+# sourced below, so the two launchers can't drift.
+#
+# What differs, and why:
+#   - Host directories reach the guest over virtiofs. Single files can't be
+#     shared that way, so they're copied in at launch instead.
+#   - Named volumes are Incus custom storage volumes.
+#   - Incus can't forward Unix sockets into a VM, so there's no clipboard or
+#     ssh-agent forwarding. VMs get keys of their own instead (VM_SSH_DIR).
+#   - ~/.claude.json can't be a single-file mount, so Claude is pointed at
+#     CLAUDE_CONFIG_DIR, which keeps that file inside the shared ~/.claude.
+
+set -euo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+REPO_DIR="$(dirname "$SELF_DIR")"
+
+# shellcheck source-path=SCRIPTDIR source=carrel
+. "$SELF_DIR/carrel"
+
+# The VMs' own ssh keys and config, shared read-only as ~/.ssh when it exists.
+# Separate from $CARREL_HOME/ssh, whose keys only ever sit behind an agent.
+VM_SSH_DIR="$CARREL_HOME/vm-ssh"
+
+# The image every variant is ultimately built from.
+VM_BASE_IMAGE="images:debian/13"
+
+# The pool that holds carrel's storage volumes.
+VM_POOL="${CARREL_INCUS_POOL:-default}"
+
+VM_DEFAULT_CPUS=4
+VM_DEFAULT_MEMORY=8GiB
+
+GUEST_HOME=/home/claude
+GUEST_UID=1000
+GUEST_PATH="$GUEST_HOME/.cargo/bin:$GUEST_HOME/.local/bin:$GUEST_HOME/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# How long to wait for a booting VM's agent, in half-second polls.
+VM_BOOT_POLLS=240
+
+vm_usage() {
+  local variants="${VARIANTS[*]}"
+  cat <<EOF
+carrel-vm — run Claude Code in a throwaway Incus VM in the current project.
+
+Usage:
+  carrel-vm [variant] [claude args...]   run Claude   (variant: ${variants// /|})
+  carrel-vm shell [variant]              open a shell instead of Claude
+  carrel-vm opencode [variant] [args...] run opencode instead of Claude
+  carrel-vm build [variant...]           build VM images (default: all)
+  carrel-vm -h | --help
+
+config, trust, sync and sessions are shared with carrel and passed straight to
+it, e.g. 'carrel-vm config get'.
+
+Options:
+  -m, --mount SPEC   pass an extra host item into the VM (repeatable).
+                     SPEC is HOST[:GUEST][:ro|:rw]; read-only by default.
+                     Files are copied in, so writes to them stay in the VM.
+      --image NAME   image alias / volume name prefix
+      --tz ZONE      guest timezone
+      --cpus N       vCPUs                    (default: $VM_DEFAULT_CPUS)
+      --memory SIZE  memory, e.g. 16GiB       (default: $VM_DEFAULT_MEMORY)
+      --dry-run      print the incus commands that would run, and exit
+
+Env:
+  CARREL_HOME        config dir on the host   (default: ~/.carrel)
+  CARREL_INCUS_POOL  storage pool for volumes (default: default)
+
+Requires: incus (with VM support), jq.
+EOF
+}
+
+require_incus() {
+  command -v incus >/dev/null 2>&1 || die "incus is required (https://linuxcontainers.org/incus/)"
+}
+
+# Run an incus command, or just print it under --dry-run.
+incus_do() {
+  if [ "$dry_run" = 1 ]; then
+    printf '%q ' incus "$@"
+    printf '\n'
+    return 0
+  fi
+  incus "$@"
+}
+
+wait_for_agent() {
+  local name="$1" polls=0
+  until incus exec "$name" -- true >/dev/null 2>&1; do
+    polls=$((polls + 1))
+    if [ "$polls" -ge "$VM_BOOT_POLLS" ]; then
+      die "VM $name didn't come up"
+    fi
+    sleep 0.5
+  done
+}
+
+random_suffix() {
+  od -An -N4 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# ─── Building images ──────────────────────────────────────────────────────────
+
+# Each variant is published from a VM booted off the one before it, the same
+# chain as the Dockerfile's stages.
+variant_parent() {
+  case "$1" in
+    base) printf '%s' "$VM_BASE_IMAGE" ;;
+    rust) printf '%s-base' "$IMAGE_NAME" ;;
+    tauri) printf '%s-rust' "$IMAGE_NAME" ;;
+  esac
+}
+
+build_variant() {
+  local variant="$1" parent name
+  parent="$(variant_parent "$variant")"
+  name="carrel-build-$variant-$(random_suffix)"
+
+  if [ "$parent" != "$VM_BASE_IMAGE" ] && ! incus image info "$parent" >/dev/null 2>&1; then
+    die "building '$variant' needs the '$parent' image; run 'carrel-vm build ${parent##*-}' first"
+  fi
+
+  echo "carrel-vm: building $IMAGE_NAME-$variant from $parent"
+  BUILD_VM="$name"
+  incus launch "$parent" "$name" --vm -c "limits.cpu=$VM_CPUS" -c "limits.memory=$VM_MEMORY"
+  wait_for_agent "$name"
+  until incus exec "$name" -- getent hosts deb.debian.org >/dev/null 2>&1; do
+    sleep 0.5
+  done
+
+  incus file push -p "$REPO_DIR/entrypoint.sh" "$name/tmp/carrel/entrypoint.sh"
+  incus file push -p "$REPO_DIR/vm/$variant.sh" "$name/tmp/carrel/provision.sh"
+  incus exec "$name" -- bash /tmp/carrel/provision.sh
+  incus exec "$name" -- rm -rf /tmp/carrel
+
+  incus stop "$name"
+  incus publish "$name" --alias "$IMAGE_NAME-$variant" --reuse
+  incus delete "$name"
+  BUILD_VM=""
+}
+
+remove_build_vm() {
+  if [ -n "${BUILD_VM:-}" ]; then
+    incus delete --force "$BUILD_VM" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_build() {
+  local variant variants=("$@")
+  [ "${#variants[@]}" -gt 0 ] || variants=("${VARIANTS[@]}")
+  for variant in "${variants[@]}"; do
+    is_variant "$variant" || die "unknown variant '$variant' (want: ${VARIANTS[*]})"
+  done
+
+  trap remove_build_vm EXIT
+  for variant in "${variants[@]}"; do
+    build_variant "$variant"
+  done
+}
+
+# ─── Launching ────────────────────────────────────────────────────────────────
+
+SHARES=()        # resolved host:guest:mode specs, attached once the VM exists
+FILE_COPIES=()   # host:guest pairs, copied in once the VM is up
+VOLUME_PATHS=()  # guest paths of volumes, chowned to the guest user at boot
+HIDDEN_PATHS=()  # guest paths covered with an empty tmpfs before the agent runs
+device_count=0
+
+add_device() {
+  device_count=$((device_count + 1))
+  local path="$1"
+  shift
+  if [ "$dry_run" = 1 ]; then
+    incus_do config device add "$VM_NAME" "carrel$device_count" disk "path=$path" "$@"
+  else
+    incus config device add "$VM_NAME" "carrel$device_count" disk "path=$path" "$@" >/dev/null
+  fi
+}
+
+ensure_volume() {
+  local volume="$1"
+  if [ "$dry_run" = 0 ] && incus storage volume show "$VM_POOL" "$volume" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$dry_run" = 1 ]; then
+    echo "# if missing:"
+  fi
+  incus_do storage volume create "$VM_POOL" "$volume"
+}
+
+# Docker-style `-v SPEC` args for the shares that come from the host, which is
+# what hide_ssh_key_dir reads.
+host_share_args() {
+  local resolved
+  for resolved in "$@"; do
+    [[ "$resolved" != /* ]] || printf '%s\n' -v "$resolved"
+  done
+}
+
+# Works out where $CARREL_HOME/ssh would show up in the VM, so it can be
+# covered, and refuses any share from inside it. bin/carrel makes the same
+# decision for the container.
+plan_hidden_paths() {
+  local args=() arg
+  while IFS= read -r arg; do args+=("$arg"); done < <(host_share_args "${SHARES[@]}")
+  hide_ssh_key_dir ${args[@]+"${args[@]}"}
+  for arg in ${SSH_KEY_DIR_ARGS[@]+"${SSH_KEY_DIR_ARGS[@]}"}; do
+    [ "$arg" = --mount ] || HIDDEN_PATHS+=("${arg#type=tmpfs,destination=}")
+  done
+}
+
+# Attach one resolved mount (host:guest:mode, as resolve_mount prints it).
+attach_share() {
+  local resolved="$1" rest host guest mode readonly=false
+  mode="${resolved##*:}"
+  rest="${resolved%:*}"
+  host="${rest%%:*}"
+  guest="${rest#*:}"
+  [ "$mode" = rw ] || readonly=true
+
+  if [[ "$host" != /* ]]; then
+    ensure_volume "$host"
+    add_device "$guest" "pool=$VM_POOL" "source=$host" "readonly=$readonly"
+    VOLUME_PATHS+=("$guest")
+  elif [ -f "$host" ]; then
+    if [ "$mode" = rw ]; then
+      echo "carrel-vm: $host is a file, so it's copied in; changes to it stay in the VM" >&2
+    fi
+    FILE_COPIES+=("$host:$guest")
+  else
+    add_device "$guest" "source=$host" "readonly=$readonly"
+  fi
+}
+
+attach_shares() {
+  local resolved
+  for resolved in "${SHARES[@]}"; do
+    attach_share "$resolved"
+  done
+}
+
+# Docker shares ~/.claude.json as a single file. Here it lives inside the shared
+# config dir instead (via CLAUDE_CONFIG_DIR), seeded once from carrel's copy so
+# the login and onboarding state carry over.
+seed_claude_json() {
+  local seeded="$CARREL_HOME/claude/.claude.json"
+  if [ ! -f "$seeded" ] && [ -f "$CARREL_HOME/claude.json" ]; then
+    cp "$CARREL_HOME/claude.json" "$seeded"
+  fi
+}
+
+# Root-only setup before the agent starts: hand fresh volumes to the guest user
+# and hide anything that mustn't be visible.
+prepare_guest() {
+  local pair host guest hidden
+  hidden="$(printf '%s\n' ${HIDDEN_PATHS[@]+"${HIDDEN_PATHS[@]}"})"
+
+  # shellcheck disable=SC2016 # expanded by the guest's shell
+  incus_do exec "$VM_NAME" -- sh -c '
+    set -e
+    owner="$1"
+    hidden="$2"
+    shift 2
+    printf "%s\n" "$hidden" | while IFS= read -r dir; do
+      if [ -n "$dir" ] && [ -d "$dir" ]; then
+        mount -t tmpfs tmpfs "$dir"
+      fi
+    done
+    for dir in "$@"; do
+      chown "$owner" "$dir"
+    done' sh "$GUEST_UID:$GUEST_UID" "$hidden" ${VOLUME_PATHS[@]+"${VOLUME_PATHS[@]}"}
+
+  for pair in ${FILE_COPIES[@]+"${FILE_COPIES[@]}"}; do
+    host="${pair%%:*}"
+    guest="${pair#*:}"
+    incus_do file push -p --uid "$GUEST_UID" --gid "$GUEST_UID" "$host" "$VM_NAME$guest"
+  done
+}
+
+remove_vm() {
+  if [ "$dry_run" = 0 ]; then
+    incus delete --force "$VM_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    -h | --help)
+      vm_usage
+      exit 0
+      ;;
+  esac
+done
+
+case "${1:-}" in
+  config | trust | sync | sessions) exec "$SELF_DIR/carrel" "$@" ;;
+esac
+
+require_jq
+
+flag_image=""
+flag_tz=""
+flag_mounts=()
+VM_CPUS="$VM_DEFAULT_CPUS"
+VM_MEMORY="$VM_DEFAULT_MEMORY"
+dry_run=0
+remaining=()
+passthrough=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      passthrough=("$@")
+      break
+      ;;
+    -m | --mount)
+      [ "$#" -ge 2 ] || die "--mount needs a spec"
+      flag_mounts+=("$2")
+      shift 2
+      ;;
+    --mount=*)
+      flag_mounts+=("${1#--mount=}")
+      shift
+      ;;
+    --image)
+      [ "$#" -ge 2 ] || die "--image needs a name"
+      flag_image="$2"
+      shift 2
+      ;;
+    --image=*)
+      flag_image="${1#--image=}"
+      shift
+      ;;
+    --tz)
+      [ "$#" -ge 2 ] || die "--tz needs a zone"
+      flag_tz="$2"
+      shift 2
+      ;;
+    --tz=*)
+      flag_tz="${1#--tz=}"
+      shift
+      ;;
+    --cpus)
+      [ "$#" -ge 2 ] || die "--cpus needs a count"
+      VM_CPUS="$2"
+      shift 2
+      ;;
+    --memory)
+      [ "$#" -ge 2 ] || die "--memory needs a size"
+      VM_MEMORY="$2"
+      shift 2
+      ;;
+    --clipboard | --ssh-agent | --ssh-agent=*)
+      die "$1 isn't supported in a VM: Incus can't forward Unix sockets into one (VMs use the keys in $VM_SSH_DIR instead)"
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    *)
+      remaining+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- ${remaining[@]+"${remaining[@]}"}
+
+if [ "${1:-}" = build ]; then
+  shift
+  require_incus
+  config_load
+  IMAGE_NAME="${flag_image:-$(config_get image)}"
+  cmd_build "$@"
+  exit 0
+fi
+
+launch=claude
+case "${1:-}" in
+  shell)
+    launch=shell
+    shift
+    ;;
+  opencode)
+    launch=opencode
+    shift
+    ;;
+esac
+
+tag=""
+if is_variant "${1:-}"; then
+  tag="$1"
+  shift
+fi
+
+if [ -t 0 ] && [ -t 2 ]; then
+  CONFIG_PROMPT=1
+fi
+config_load
+
+[ "$dry_run" = 1 ] || require_incus
+
+IMAGE_NAME="${flag_image:-$(config_get image)}"
+TZ_OVERRIDE="${flag_tz:-$(config_get tz)}"
+[ -n "$tag" ] || tag="$(config_get variant)"
+
+if [ "$(config_get clipboard)" = true ]; then
+  echo "carrel-vm: clipboard isn't supported in a VM; continuing without it" >&2
+fi
+ssh_agent_mode="$(config_get ssh_agent)"
+if [ -n "$ssh_agent_mode" ] && [ "$ssh_agent_mode" != off ]; then
+  echo "carrel-vm: ssh_agent isn't supported in a VM (it uses the keys in $VM_SSH_DIR instead); continuing without it" >&2
+fi
+
+EXTRA_MOUNTS=()
+while IFS= read -r spec; do
+  [ -n "$spec" ] && EXTRA_MOUNTS+=("$spec")
+done < <(config_get mounts)
+EXTRA_MOUNTS+=(${flag_mounts[@]+"${flag_mounts[@]}"})
+
+if [ "$dry_run" = 0 ]; then
+  do_sync
+  seed_claude_json
+fi
+
+# The same layout bin/carrel gives the container.
+SHARES=(
+  "$CARREL_HOME/claude:$GUEST_HOME/.claude:rw"
+  "$CARREL_HOME/opencode/config:$GUEST_HOME/.config/opencode:rw"
+  "$CARREL_HOME/opencode/data:$GUEST_HOME/.local/share/opencode:rw"
+  "$CARREL_HOME/opencode/state:$GUEST_HOME/.local/state/opencode:rw"
+  "${IMAGE_NAME}-claude:$GUEST_HOME/.local/share/claude:rw"
+  "${IMAGE_NAME}-opencode:$GUEST_HOME/.opencode:rw"
+  "${IMAGE_NAME}-opencode-cache:$GUEST_HOME/.cache/opencode:rw"
+  "${IMAGE_NAME}-node:$GUEST_HOME/.nvm/versions/node:rw"
+  "$PWD:$PWD:rw"
+)
+if [ -d "$VM_SSH_DIR" ]; then
+  SHARES+=("$VM_SSH_DIR:$GUEST_HOME/.ssh:ro")
+fi
+
+# worktree_args prints docker `-v SPEC` pairs; only the specs are wanted here.
+while IFS= read -r arg; do
+  [ "$arg" = -v ] || SHARES+=("$arg")
+done < <(worktree_args)
+
+for spec in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
+  resolved="$(resolve_mount "$spec")" || continue
+  SHARES+=("$resolved")
+done
+
+plan_hidden_paths
+VM_NAME="carrel-$tag-$(random_suffix)"
+trap remove_vm EXIT
+
+# Ephemeral: Incus deletes the VM as soon as it stops, the equivalent of --rm.
+incus_do init "${IMAGE_NAME}-$tag" "$VM_NAME" --vm --ephemeral \
+  -c "limits.cpu=$VM_CPUS" -c "limits.memory=$VM_MEMORY"
+attach_shares
+
+exec_env=(
+  --env "HOME=$GUEST_HOME"
+  --env USER=claude
+  --env "PATH=$GUEST_PATH"
+  --env "TERM=${TERM:-xterm-256color}"
+  --env LANG=C.UTF-8
+  --env LC_ALL=C.UTF-8
+  --env NPM_CONFIG_UPDATE_NOTIFIER=false
+  --env NPM_CONFIG_FUND=false
+  --env "CLAUDE_CONFIG_DIR=$GUEST_HOME/.claude"
+  --env "RUSTUP_HOME=$GUEST_HOME/.rustup"
+  --env "CARGO_HOME=$GUEST_HOME/.cargo"
+)
+tz="$(host_timezone)"
+[ -n "$tz" ] && exec_env+=(--env "TZ=$tz")
+
+case "$launch" in
+  shell) agent=(bash) ;;
+  opencode) agent=(opencode "$@" ${passthrough[@]+"${passthrough[@]}"}) ;;
+  *) agent=(claude "$@" ${passthrough[@]+"${passthrough[@]}"}) ;;
+esac
+
+incus_do start "$VM_NAME"
+[ "$dry_run" = 1 ] || wait_for_agent "$VM_NAME"
+prepare_guest
+
+status=0
+incus_do exec "$VM_NAME" --user "$GUEST_UID" --group "$GUEST_UID" --cwd "$PWD" \
+  "${exec_env[@]}" -- carrel-entrypoint "${agent[@]}" || status=$?
+exit "$status"
